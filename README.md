@@ -139,6 +139,27 @@ The rest of the NVIDIA work:
 
 **Reboot before believing any of it.** The driver is not in use until then.
 
+### GTK scaling
+
+Omarchy's `monitors.lua` template ships `local omarchy_gdk_scale = 2`, which
+tells GTK apps to draw at 2x. That is right for a HiDPI panel and wrong
+everywhere else — on a standard-DPI display every GTK window comes out
+oversized, and the same mismatch reaches plugin GUIs launched through Wine from
+a DAW. The script sets it to `1`.
+
+Only the single `local omarchy_gdk_scale = N` line is rewritten, with a
+timestamped `.bak` alongside; the rest of `monitors.lua` is your own monitor
+layout and is left untouched. If the line is missing — a restructured config —
+it warns and changes nothing rather than guessing. When a Hyprland session is
+running it validates with `hyprctl reload` and `hyprctl configerrors`;
+otherwise the change applies at next login.
+
+On an actual HiDPI screen, keep the Omarchy default:
+
+```bash
+GDK_SCALE_VALUE=2 ./system_setup_arch.sh
+```
+
 ## Wine and yabridge — read this before running
 
 This is the part most likely to waste your afternoon.

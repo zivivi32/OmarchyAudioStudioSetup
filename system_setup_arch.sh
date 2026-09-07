@@ -414,6 +414,76 @@ setup_nvidia() {
 }
 
 # =============================================================================
+# ── GTK SCALING ───────────────────────────────────────────────────────────────
+# =============================================================================
+
+# Omarchy ships monitors.lua with `local omarchy_gdk_scale = 2`, which tells GTK
+# apps to draw at 2x. That is right for a HiDPI panel and wrong everywhere else:
+# on a standard-DPI display every GTK window comes out oversized, and the same
+# mismatch reaches plugin GUIs launched through Wine from a DAW.
+#
+# Only the one `local omarchy_gdk_scale = N` line is rewritten. The rest of
+# monitors.lua is the user's own monitor layout and has to survive untouched,
+# which is why this is a targeted sed rather than a template copy.
+#
+# Override with GDK_SCALE_VALUE=2 if you are on a HiDPI screen and want the
+# Omarchy default back.
+setup_gdk_scale() {
+  section "GTK scaling"
+
+  local conf="$HOME/.config/hypr/monitors.lua"
+  local want="${GDK_SCALE_VALUE:-1}"
+  local current
+
+  if [[ ! -f $conf ]]; then
+    warn "No $conf yet — skipping. Omarchy writes it on first login;"
+    warn "re-run this script afterwards, or set it by hand."
+    return
+  fi
+
+  current=$(sed -nE 's/^[[:space:]]*local[[:space:]]+omarchy_gdk_scale[[:space:]]*=[[:space:]]*([0-9.]+).*/\1/p' \
+    "$conf" | head -1)
+
+  if [[ -z $current ]]; then
+    warn "No 'local omarchy_gdk_scale' line in $conf — leaving it alone rather"
+    warn "than guessing at a config that has been restructured."
+    note_failure "gdk scale (unrecognised monitors.lua)"
+    return
+  fi
+
+  if [[ $current == "$want" ]]; then
+    ok "GDK_SCALE already $want."
+    return
+  fi
+
+  info "Setting GDK_SCALE $current -> $want in monitors.lua..."
+  if $DRY_RUN; then
+    log "  [dry-run] would set omarchy_gdk_scale = $want in $conf"
+    return
+  fi
+
+  cp "$conf" "$conf.bak.$(date +%s)"
+  sed -i -E "s|^([[:space:]]*local[[:space:]]+omarchy_gdk_scale[[:space:]]*=).*|\1 $want|" "$conf"
+
+  # Hyprland auto-reloads on save, but validate explicitly — and only when a
+  # session is actually running, since this script may run before one exists.
+  if has_cmd hyprctl && [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+    hyprctl reload >>"$LOG" 2>&1 || true
+    local errs
+    errs=$(hyprctl configerrors 2>/dev/null || true)
+    if [[ -n $errs && $errs != *"no errors"* ]]; then
+      err "Hyprland reported config errors after the change:"
+      log "$errs"
+      note_failure "gdk scale (hyprctl configerrors)"
+      return
+    fi
+    ok "GDK_SCALE set to $want; Hyprland reloaded cleanly."
+  else
+    ok "GDK_SCALE set to $want (applies at next login)."
+  fi
+}
+
+# =============================================================================
 # ── POST-INSTALL CONFIG ───────────────────────────────────────────────────────
 # =============================================================================
 
@@ -586,6 +656,7 @@ fi
 
 # =============================================================================
 setup_nvidia
+setup_gdk_scale
 # =============================================================================
 
 # =============================================================================
