@@ -76,6 +76,9 @@ notify() {
 
 warn() { echo "WARNING: $1" >&2; }
 
+# Resolve alongside this script, so it can be run from anywhere.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # The retired URL and its replacement. Kept as constants because both the
 # live patch and the pacman hook below have to agree on them exactly.
 NA_URL_OLD='https://www.native-instruments.com/fileadmin/downloads/Native-Access_2.exe'
@@ -307,166 +310,22 @@ fi
 # ------------------------------------------------------------------------------------
 notify "yabridge"
 
-# yabridge is taken from upstream's own build artifacts -- never from the AUR.
-#
-# Provenance is the first reason: an AUR PKGBUILD is a third-party recipe, while
-# these artifacts are produced by yabridge's own GitHub Actions workflow from the
-# commit they are named after.
-#
-# The second reason is that on Wine 11 the AUR build cannot succeed at all. Wine's
-# Unix-side import libraries (/usr/lib/wine/x86_64-unix/lib*.a) are full of
-# references to __wine$func$<dll>$<ordinal>$<name> placeholder symbols that
-# winebuild is supposed to resolve while linking. On Arch's wine 11.16 nothing on
-# the system defines them (1236 references in libkernel32.a alone, zero
-# definitions anywhere) and winebuild only emits thunks for a handful of CRT entry
-# points, so linking yabridge-host.exe.so dies with ~200 undefined references.
-# Both the 64-bit host and the bitbridge fail, so -Dbitbridge=false does not help.
-#
-# The last tagged release (5.1.1, Nov 2024) predates Wine 10 editor embedding and
-# breaks on Wine 9.22+, so master is what we want, and master ships only as a CI
-# artifact. Upstream repository, for the record:
-#
-#   https://github.com/robbert-vdh/yabridge
-#
-# (It is GitHub, not GitLab -- there is no GitLab mirror.)
-YABRIDGE_REPO=robbert-vdh/yabridge
-YABRIDGE_WORKFLOW=build
-YABRIDGE_BRANCH=master
-YABRIDGE_NIGHTLY="https://nightly.link/$YABRIDGE_REPO/workflows/$YABRIDGE_WORKFLOW/$YABRIDGE_BRANCH"
-
 WINE_VER="$(wine --version 2>/dev/null | sed 's/^wine-//; s/ .*//' || true)"
 echo "Wine version in use: ${WINE_VER:-unknown}"
 
-# Same check, made runtime rather than assumed, so this script keeps working on a
-# machine whose Wine can still link Winelib binaries.
-#
-# `grep -c`, not `grep -q`: this script runs under `set -o pipefail`, and a
-# `grep -q` that exits on its first match SIGPIPEs the `nm` feeding it, which
-# pipefail then reports as a failed pipeline (exit 141). Counting reads all of
-# the input, so the exit status means what it looks like it means.
-wine_import_libs_broken() {
-  local dir=/usr/lib/wine/x86_64-unix refs defs
-  [[ -f $dir/libkernel32.a ]] || return 1
-  refs="$(nm -u "$dir/libkernel32.a" 2>/dev/null | grep -cF '__wine$func$' || true)"
-  ((${refs:-0} > 0)) || return 1
-  # Broken only if nothing anywhere actually defines what they reference.
-  defs="$(nm -A --defined-only "$dir"/*.a 2>/dev/null | grep -cF '__wine$func$' || true)"
-  ((${defs:-0} == 0))
-}
-
-# Fetch artifact <name> ("yabridge" or "yabridgectl") from upstream's most recent
-# successful master build and unpack it into <tmpdir>, leaving <tmpdir>/<name>/.
-#
-# `gh` talks to api.github.com directly, which is the cleanest provenance, but
-# GitHub requires a login to download workflow artifacts at all. When gh is
-# missing or logged out we fall back to nightly.link, a third-party proxy for
-# exactly that endpoint -- it serves the bytes itself rather than redirecting to
-# GitHub, so it is trusted infrastructure in the chain. Both routes end at the
-# same artifact from the same upstream workflow run.
-fetch_yabridge_artifact() { # <name> <tmpdir>
-  local name=$1 tmp=$2 url="" run="" tarball=""
-
-  if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-    echo "Fetching '$name' from api.github.com via gh ($YABRIDGE_REPO@$YABRIDGE_BRANCH)"
-    run="$(gh run list --repo "$YABRIDGE_REPO" --workflow "$YABRIDGE_WORKFLOW" \
-      --branch "$YABRIDGE_BRANCH" --status success --limit 1 \
-      --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
-    if [[ -n $run ]]; then
-      gh run download "$run" --repo "$YABRIDGE_REPO" --pattern "$name-*" \
-        --dir "$tmp/gh" &>/dev/null || true
-    else
-      warn "could not resolve a successful $YABRIDGE_BRANCH run via gh"
-    fi
-    # gh unzips artifacts on the way in, so the tarball may already be here.
-    tarball="$(find "$tmp" -name "$name-*.tar.gz" -print -quit 2>/dev/null || true)"
-    [[ -n $tarball ]] || warn "gh download did not yield '$name'; using nightly.link"
-  fi
-
-  if [[ -z $tarball ]]; then
-    url="$(curl -fsSL "$YABRIDGE_NIGHTLY" 2>/dev/null |
-      grep -oE "https://[^\"]*/$name-[^\"]*\.tar\.gz\.zip" | head -n1 || true)"
-    if [[ -z $url ]]; then
-      warn "No '$name' artifact found at $YABRIDGE_NIGHTLY"
-      return 1
-    fi
-    echo "Fetching '$name' from $url"
-    curl -fsSL -o "$tmp/$name.zip" "$url" || return 1
-    # GitHub wraps the project's own .tar.gz inside the artifact .zip, so this
-    # has to be unpacked twice.
-    unzip -oq "$tmp/$name.zip" -d "$tmp" || return 1
-    tarball="$(find "$tmp" -name "$name-*.tar.gz" -print -quit 2>/dev/null || true)"
-  fi
-
-  [[ -n $tarball ]] || { warn "no '$name' tarball in the downloaded artifact"; return 1; }
-  echo "Unpacking $(basename "$tarball")"
-  tar xzf "$tarball" -C "$tmp" || return 1
-  [[ -d $tmp/$name ]] || { warn "unexpected layout in $(basename "$tarball")"; return 1; }
-}
-
-_install_yabridge_into() { # <tmpdir>
-  local tmp=$1
-  fetch_yabridge_artifact yabridge "$tmp" || return 1
-  mkdir -p "$HOME/.local/share/yabridge"
-  cp -a "$tmp/yabridge/." "$HOME/.local/share/yabridge/" || return 1
-  echo "Installed yabridge to ~/.local/share/yabridge"
-  # Prove the Winelib host actually loads under this Wine before moving on -- a
-  # downloaded binary that cannot start is worth catching here, not in a DAW.
-  # It prints its banner on stderr, hence the redirect. Captured into a variable
-  # rather than piped into `grep -q`, which would SIGPIPE the host and trip
-  # pipefail, failing this check on a yabridge that is in fact working.
-  local banner
-  banner="$("$HOME/.local/share/yabridge/yabridge-host.exe" 2>&1 || true)"
-  if [[ $banner == *"yabridge host version"* ]]; then
-    echo "Verified: yabridge-host.exe runs under Wine ${WINE_VER:-unknown}"
-  else
-    warn "yabridge-host.exe did not report a version; it may not run on this Wine."
-    return 1
-  fi
-}
-
-_install_yabridgectl_into() { # <tmpdir>
-  local tmp=$1
-  fetch_yabridge_artifact yabridgectl "$tmp" || return 1
-  mkdir -p "$HOME/.local/bin"
-  install -m755 "$tmp/yabridgectl/yabridgectl" "$HOME/.local/bin/yabridgectl" || return 1
-  echo "Installed yabridgectl to ~/.local/bin"
-}
-
-# mktemp + cleanup wrapper, so every early `return 1` above still tidies up.
-run_in_tmpdir() { # <function> [args...]
-  local fn=$1 tmp rc=0
-  shift
-  tmp="$(mktemp -d)" || return 1
-  "$fn" "$tmp" "$@" || rc=$?
-  rm -rf "$tmp"
-  return "$rc"
-}
-
-# AUR builds of the same software would shadow what we install: yabridge-git and
-# yabridge-bin drop their libraries in /usr/lib, which yabridgectl prefers over
-# ~/.local/share, and /usr/bin precedes ~/.local/bin on the default Arch PATH.
-aur_pkgs=()
-for pkg in yabridge-git yabridge-bin yabridgectl-git; do
-  pacman -Qq "$pkg" &>/dev/null && aur_pkgs+=("$pkg")
-done
-if ((${#aur_pkgs[@]})); then
-  warn "AUR builds of yabridge are installed: ${aur_pkgs[*]}"
-  warn "They take precedence over the upstream binaries this script installs"
-  warn "(/usr/lib over ~/.local/share, and /usr/bin before ~/.local/bin)."
-  warn "Remove them so the upstream build is the one that gets used:"
-  warn "  sudo pacman -Rns ${aur_pkgs[*]}"
+# yabridge and yabridgectl come from upstream's own build artifacts, never the
+# AUR. The reasoning, and the Wine 11 link failure that makes building it here
+# impossible, are documented at the top of lib_yabridge.sh -- which
+# omarchy_audio_setup.sh sources too, so both scripts install the same build.
+# shellcheck source=lib_yabridge.sh
+if [[ -r $SCRIPT_DIR/lib_yabridge.sh ]]; then
+  source "$SCRIPT_DIR/lib_yabridge.sh"
+  install_yabridge_from_upstream ||
+    warn "yabridge install failed; see the notes at the end."
+else
+  warn "lib_yabridge.sh not found next to this script; skipping yabridge."
+  warn "Expected at: $SCRIPT_DIR/lib_yabridge.sh"
 fi
-
-if wine_import_libs_broken; then
-  echo
-  echo "This Wine (${WINE_VER:-unknown}) cannot link Winelib binaries, so yabridge"
-  echo "cannot be compiled here. Installing upstream's build of the same commit."
-fi
-
-run_in_tmpdir _install_yabridge_into ||
-  warn "yabridge install failed; see the notes at the end."
-run_in_tmpdir _install_yabridgectl_into ||
-  warn "yabridgectl install failed; see the notes at the end."
 
 # Upstream ships a bitbridge (32-bit plugin support) in the same artifact, but it
 # cannot work against Wine's new WoW64 build mode, which is what Arch now ships.
@@ -508,7 +367,9 @@ if command -v yabridgectl &>/dev/null; then
     # yabridgectl refuses paths that do not exist, and Native Access only
     # creates VST3/ once you install your first plugin.
     mkdir -p "$dir"
-    if yabridgectl status 2>/dev/null | grep -Fq "$dir"; then
+    # Captured rather than piped into `grep -q`: under `set -o pipefail` a
+    # `grep -q` that exits on its first match can SIGPIPE the writer feeding it.
+    if [[ "$(yabridgectl status 2>/dev/null || true)" == *"$dir"* ]]; then
       echo "Already registered: $dir"
     else
       yabridgectl add "$dir"
@@ -540,11 +401,15 @@ check() {
 [[ -n $NA_EXE && -f $NA_EXE ]] && na_ok=yes || na_ok=no
 [[ -n $NTK_EXE && -f $NTK_EXE ]] && ntk_ok=yes || ntk_ok=no
 command -v yabridgectl &>/dev/null && yab_ok=yes || yab_ok=no
-[[ -f $HOME/.local/share/yabridge/libyabridge-chainloader-vst2.so ]] &&
+[[ -f ${YABRIDGE_LIB_DIR:-$HOME/.local/share/yabridge}/libyabridge-chainloader-vst2.so ]] &&
   yablib_ok=yes || yablib_ok=no
-# An AUR build in /usr would win over the upstream one we just installed, so
-# treat its presence as unfinished business rather than as success.
-((${#aur_pkgs[@]} == 0)) && aurfree_ok=yes || aurfree_ok=no
+# An AUR build in /usr would win over the upstream one, so treat any survivor as
+# unfinished business rather than as success.
+leftover_aur=()
+for pkg in yabridge-git yabridge-bin yabridgectl-git; do
+  pacman -Qq "$pkg" &>/dev/null && leftover_aur+=("$pkg")
+done
+((${#leftover_aur[@]} == 0)) && aurfree_ok=yes || aurfree_ok=no
 
 check "URL fix script installed" "$fix_ok"
 check "pacman hook installed (survives -Syu)" "$hook_ok"
@@ -553,7 +418,7 @@ check "Native Access installed" "$na_ok" "run 'ni doctor'"
 check "NTKDaemon installed" "$ntk_ok" "re-run 'ni setup'"
 check "yabridgectl available" "$yab_ok" "download may have failed"
 check "yabridge (upstream build) in ~/.local/share" "$yablib_ok" "download may have failed"
-check "no AUR yabridge shadowing it" "$aurfree_ok" "sudo pacman -Rns ${aur_pkgs[*]:-}"
+check "no AUR yabridge shadowing it" "$aurfree_ok" "sudo pacman -Rns ${leftover_aur[*]:-}"
 
 notify "Done"
 cat <<EOF

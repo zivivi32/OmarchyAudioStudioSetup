@@ -6,30 +6,54 @@ Windows VST plugins via Wine + yabridge.
 
 | File | Purpose |
 | --- | --- |
-| `omarchy_audio_setup.sh` | The Omarchy version. **Use this one.** |
-| `ni_yabridge_setup.sh` | Native Instruments (Native Access) + yabridge, side by side. |
+| `setup_all.sh` | Runs everything below in the right order. **Start here.** |
+| `system_setup_arch.sh` | Base system: NVIDIA drivers, dev tools, apps. Step 1. |
+| `omarchy_audio_setup.sh` | Audio stack, kernel params, REAPER, Wine, yabridge. Step 2. |
+| `ni_yabridge_setup.sh` | Native Instruments (Native Access) + yabridge. Step 3. |
+| `lib_yabridge.sh` | Shared: installs yabridge from upstream. Sourced, not run. |
 | `ni_install_libraries.sh` | Mounts NI library `.iso` files and runs their installers. |
-| `arch_audio_setup.sh` | The original plain-Arch script, kept for reference. |
 
 ## Quick start
 
+On a fresh Omarchy install, one command does the lot:
+
 ```bash
-chmod +x omarchy_audio_setup.sh
-./omarchy_audio_setup.sh
-sudo reboot          # required: kernel params, group membership and limits
+chmod +x setup_all.sh
+./setup_all.sh
+sudo reboot          # required: kernel params, drivers, group membership, limits
 ```
 
-Run it as your normal user, not as root — it uses `sudo` where it needs to, and
-installs REAPER and the Wine prefix into your `$HOME`. The whole script is
-idempotent, so re-running it is safe.
+Skip the parts you do not want:
 
-## Why a separate Omarchy script
+```bash
+./setup_all.sh --no-system   # you have already set the machine up
+./setup_all.sh --no-ni       # you do not use Native Instruments
+./setup_all.sh --reboot      # reboot at the end instead of just saying to
+```
 
-The Arch script does not run on Omarchy. The blocker is the bootloader.
+The individual scripts still run standalone, in this order — `setup_all.sh` is
+only a wrapper:
+
+```bash
+./system_setup_arch.sh && ./omarchy_audio_setup.sh && ./ni_yabridge_setup.sh
+```
+
+Order matters. Step 1 installs graphics drivers and rebuilds the UKI, step 2
+adds its own kernel parameters on top, and step 3 needs the Wine that step 2
+settled on.
+
+Run them as your normal user, not as root — they use `sudo` where they need to,
+and install REAPER and the Wine prefixes into your `$HOME`. All of them are
+idempotent, so re-running after a failure is safe: completed work is skipped.
+
+## Why this is not the usual Arch audio script
+
+These scripts are descended from a plain-Arch/CachyOS setup, which does not run
+on Omarchy. The blocker is the bootloader.
 
 **Omarchy does not use GRUB.** It boots with Limine and a Unified Kernel Image,
 so there is no `/etc/default/grub` to `sed` and no `grub-mkconfig` to run. The
-original script fails at exactly that step.
+original fails at exactly that step.
 
 On Omarchy, kernel parameters are assembled by `limine-entry-tool` from
 drop-ins. This script writes its own file rather than editing Omarchy's:
@@ -47,7 +71,7 @@ Omarchy update can never clobber your settings.
 > bootloader binary to the ESP and rebuilds everything a second time for no
 > benefit. Omarchy's own code documents this distinction.
 
-Other differences from the Arch script:
+Other differences from the original:
 
 - **No PulseAudio prompt.** Omarchy already ships the full PipeWire stack, and
   there is no PulseAudio to remove.
@@ -61,34 +85,93 @@ Other differences from the Arch script:
 - **REAPER is not pinned to a dead URL.** It resolves the current build from
   reaper.fm, with a known-good fallback.
 
+## Base system — `system_setup_arch.sh`
+
+Step 1. Installs the base package set (dev tools, gaming, media apps), enables
+`[multilib]`, and sets up graphics drivers. `-n` does a dry run that changes
+nothing.
+
+Despite the name it is the Omarchy port: it uses `omarchy-pkg-add` /
+`omarchy-pkg-aur-add`, leaves Omarchy's own snapshot, firewall and Neovim setup
+alone, and rebuilds the boot image with `limine-mkinitcpio` rather than
+`grub-mkconfig`.
+
+### NVIDIA
+
+Safe to run on any machine — with no NVIDIA GPU present the whole section is
+skipped and nothing graphics-related is touched.
+
+Detection is delegated to Omarchy's own `omarchy-hw-nvidia*` helpers, with
+fallbacks that read the same cached sysfs IDs. Neither path calls `lspci`,
+which reads PCI config space and will resume a runtime-suspended GPU.
+
+| GPU | Detected as | Driver installed |
+| --- | --- | --- |
+| Turing (RTX 20xx) and newer | GSP firmware, device ID ≥ `0x1e00` | `nvidia-open-dkms`, `nvidia-utils`, `lib32-nvidia-utils`, `libva-nvidia-driver` |
+| Maxwell / Pascal / Volta | `0x1340` – `0x1e00` | `nvidia-580xx-dkms`, `nvidia-580xx-utils`, `lib32-nvidia-580xx-utils` |
+| Kepler and older | below `0x1340` | **none** — reports the GPU as unsupported and leaves graphics alone |
+
+That third row matters. An earlier version of this script had only two branches
+and fell through to the 580xx driver for anything pre-Turing. On a Kepler card
+that installs a driver which cannot drive the GPU, and because the script then
+rebuilds the UKI, the failure lands as a black screen on the next boot rather
+than as an error you can read. Arch no longer packages a legacy driver for
+those cards, so refusing is the only correct answer —
+[Arch's NVIDIA page](https://wiki.archlinux.org/title/NVIDIA) covers the
+options.
+
+The rest of the NVIDIA work:
+
+- **Kernel headers first.** DKMS needs headers for the running kernel; the
+  script resolves the kernel package with `pacman -Qqs` and installs the
+  matching `-headers` before the driver, so the module actually builds.
+- **Early KMS.** Writes `options nvidia_drm modeset=1` to
+  `/etc/modprobe.d/nvidia.conf` and the four `nvidia*` modules to
+  `/etc/mkinitcpio.conf.d/nvidia.conf`. Without `modeset=1` you get a black
+  screen or a torn handoff into Hyprland.
+- **UKI rebuild.** The Omarchy-specific step, and the easy one to miss: Omarchy
+  boots Limine + a Unified Kernel Image, so those drop-ins do nothing until
+  `limine-mkinitcpio` runs. It only rebuilds when something actually changed,
+  so re-runs are cheap.
+- **No Hyprland env vars.** `LIBVA_DRIVER_NAME` and friends are deliberately not
+  written to a shell rc — Omarchy's `default/hypr/nvidia.lua` sets them per
+  session when it detects the card, and a second copy only drifts.
+
+**Reboot before believing any of it.** The driver is not in use until then.
+
 ## Wine and yabridge — read this before running
 
 This is the part most likely to waste your afternoon.
 
 The newest yabridge **release** is 5.1.1 (Nov 2024), and
 [it does not work with Wine 9.22 or newer](https://github.com/robbert-vdh/yabridge#downgrading-wine).
-Arch currently ships `wine-staging` **11.x**. So installing Wine straight from
-the repos gives you a yabridge whose plugin editor windows are broken.
+Arch currently ships Wine **11.x**. That used to force a real choice, and the
+old default was to pin Wine back to 9.21.
 
-The script handles this with a `WINE_STRATEGY` knob:
+**That is no longer the default, and you should not need to think about it.**
+This repo now installs yabridge from upstream's master artifacts, and master has
+merged Wine 10+ editor embedding — so current Wine is the supported setup:
 
 ```bash
-./omarchy_audio_setup.sh                        # pin    (default)
-WINE_STRATEGY=latest ./omarchy_audio_setup.sh   # latest
+./omarchy_audio_setup.sh                     # latest (default)
+WINE_STRATEGY=pin ./omarchy_audio_setup.sh   # pin, only if you want 5.1.1
 ```
 
-**`pin`** (default, and upstream's documented recommendation) installs
-`wine-staging 9.21-1` from the Arch Linux Archive, holds it with `IgnorePkg`,
-and installs the released `yabridge-bin`.
+**`latest`** (default) leaves your Wine alone and takes yabridge from master.
 
-**`latest`** uses current `wine-staging` and deliberately does *not* install
-`yabridge-bin` over a build you may have put in place yourself. You must build
-yabridge from master, which has merged (but **not released**) Wine 10 editor
-embedding support.
+**`pin`** installs `wine-staging 9.21-1` from the Arch Linux Archive and holds
+it with `IgnorePkg`. It is only useful if you specifically want the tagged
+release, and it **breaks Native Access**, which needs current Wine.
+
+The default flipped because pinning is actively wrong on a fresh install. The
+guard that refuses to pin under Native Access can only fire once `ni-wine` is
+installed — and on a new machine it is not installed *yet*. Running the scripts
+in order would otherwise pin Wine in step 2 and install Native Access onto 9.21
+in step 3.
 
 Either way the script checks the resulting Wine version with `vercmp` and warns
-loudly on a mismatch, so the problem shows up as a message rather than as
-mysterious broken windows.
+on a mismatch, so the problem shows up as a message rather than as mysterious
+broken windows.
 
 ### The pin needs a hook to survive
 
@@ -121,21 +204,21 @@ Sets up Native Access (via the `ni-wine` AUR package) so it coexists with
 yabridge, and registers the NI prefix so NI plugins reach your DAW.
 
 ```bash
-WINE_STRATEGY=latest ./omarchy_audio_setup.sh
-./ni_yabridge_setup.sh
+./setup_all.sh       # or: ./omarchy_audio_setup.sh && ./ni_yabridge_setup.sh
 sudo reboot
 ```
 
-### It forces the `latest` branch, on purpose
+### It needs the `latest` branch, and that is now the default
 
 Native Access 2 is an Electron app, verified working on Wine 11.x and untested
 on 9.21. Pinning would also downgrade Wine underneath a prefix built with a
 newer one, and Wine prefixes do not downgrade cleanly.
 
-So the two halves of this repo pull in opposite directions, and NI wins: keep
-current Wine, and take yabridge from master instead of the 5.1.1 release.
-`omarchy_audio_setup.sh` now **refuses to pin** when `ni-wine` is installed,
-rather than silently breaking a working Native Access:
+So the two halves of this repo used to pull in opposite directions, and NI wins:
+keep current Wine, and take yabridge from master instead of the 5.1.1 release.
+That is now simply the default. As a second line of defence,
+`omarchy_audio_setup.sh` also **refuses to pin** when `ni-wine` is already
+installed, rather than silently breaking a working Native Access:
 
 ```
 ni-wine is installed, and WINE_STRATEGY=pin would downgrade Wine to
@@ -208,6 +291,31 @@ unvalidated download content type, and `check=False` on the installer run).
   The last tagged release (5.1.1, Nov 2024) predates Wine 10 editor embedding
   and breaks on Wine 9.22+, so master is what is wanted, and master ships only
   as a CI artifact.
+- **The yabridge version is pinned, with a fallback.** `YABRIDGE_VERSION` in
+  `lib_yabridge.sh` names the exact build, so two machines set up months apart
+  get the same yabridge. It is a preference rather than a hard pin, because
+  GitHub Actions artifacts **expire after 90 days** while master builds land
+  roughly three times a year — there were 96 days between the Apr 2026 and Aug
+  2026 builds, so for about a week in late July no master artifact was
+  downloadable at all. A hard pin would therefore become a dead link on
+  schedule. What actually happens:
+
+  1. Already installed at the pinned version → nothing is downloaded. After the
+     first run this is the normal case, which is what makes an existing install
+     immune to a later expiry.
+  2. Otherwise the pin is resolved to a concrete workflow run whose artifacts
+     are still live, and that is installed.
+  3. If the pinned run has expired, it falls back to the newest live build and
+     says so, rather than leaving you with no yabridge. The warning tells you
+     what to set `YABRIDGE_VERSION` to if you want to adopt the new build as
+     the pin.
+
+  A failed download never overwrites a working install, so the worst case is
+  keeping what you already had. `YABRIDGE_VERSION=latest` tracks master HEAD.
+- **Both artifacts come from the same run.** `yabridge` and `yabridgectl` are
+  published as two separate artifacts; resolving them independently could
+  straddle a new build and pair a host with a `yabridgectl` from a different
+  commit, so the run is resolved once and both are pulled from it.
 - **Remove any AUR yabridge first.** `yabridge-git` and `yabridge-bin` install
   into `/usr/lib`, which yabridgectl prefers over `~/.local/share`, and
   `/usr/bin` precedes `~/.local/bin` on the default Arch `PATH` — so an AUR

@@ -2,7 +2,7 @@
 # ---------------------------
 # Configure Omarchy (Arch + Hyprland) for pro audio USING PIPEWIRE.
 #
-# This is the Omarchy port of arch_audio_setup.sh. The important difference:
+# This is the Omarchy port of a plain-Arch/CachyOS setup. The important difference:
 # Omarchy does NOT use GRUB. It boots with Limine + a Unified Kernel Image,
 # so kernel parameters are set with a drop-in in /etc/limine-entry-tool.d/
 # and applied with `limine-mkinitcpio` -- there is no /etc/default/grub to
@@ -40,6 +40,9 @@ notify() {
 }
 
 warn() { echo "WARNING: $1" >&2; }
+
+# Resolve alongside this script, so it can be run from anywhere.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # ------------------------------------------------------------------------------------
 # Preflight
@@ -92,21 +95,29 @@ trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 # ------------------------------------------------------------------------------------
 # Wine / yabridge strategy
 #
-# This matters more than it looks. The newest yabridge RELEASE is 5.1.1
-# (Nov 2024), and it does not work with Wine 9.22 or anything newer -- plugin
-# editor windows break. Arch currently ships wine-staging 11.x, so installing
-# Wine straight from the repos gives you a broken yabridge.
-# Upstream: https://github.com/robbert-vdh/yabridge#downgrading-wine
+# The newest yabridge RELEASE is 5.1.1 (Nov 2024) and it does not work with Wine
+# 9.22 or anything newer -- plugin editor windows break. That used to force a
+# choice: pin Wine back to 9.21, or run current Wine with a yabridge you built
+# yourself. Upstream: https://github.com/robbert-vdh/yabridge#downgrading-wine
 #
-#   pin    (default) Hold wine-staging at 9.21 and use the released
-#          yabridge-bin. This is upstream's documented recommendation.
-#   latest Use the current wine-staging. yabridge's master branch has merged
-#          Wine 10 editor embedding support, but it is UNRELEASED -- you must
-#          build yabridge from master yourself, or editor windows will break.
+# That choice is gone. This repo now installs yabridge from upstream's master
+# artifacts (see lib_yabridge.sh), and master has merged Wine 10+ editor
+# embedding, so current Wine is the supported configuration:
 #
-# Override at run time:  WINE_STRATEGY=latest ./omarchy_audio_setup.sh
+#   latest (default) Current wine/wine-staging, with yabridge from master.
+#   pin              Hold wine-staging at 9.21 for the 5.1.1 release. Only
+#                    useful if you specifically want the tagged release; it also
+#                    breaks Native Access, which needs current Wine.
+#
+# 'latest' is the default because pinning is actively wrong for a fresh install:
+# it downgrades Wine underneath Native Access, and on a machine where ni-wine is
+# not installed *yet* the guard below has nothing to catch. Running the two
+# scripts in order on a new box would otherwise pin Wine first and install
+# Native Access onto 9.21 second.
+#
+# Override at run time:  WINE_STRATEGY=pin ./omarchy_audio_setup.sh
 # ------------------------------------------------------------------------------------
-WINE_STRATEGY="${WINE_STRATEGY:-pin}"
+WINE_STRATEGY="${WINE_STRATEGY:-latest}"
 WINE_PIN_VERSION="${WINE_PIN_VERSION:-9.21-1}"
 
 if [[ $WINE_STRATEGY != "pin" && $WINE_STRATEGY != "latest" ]]; then
@@ -391,7 +402,21 @@ else
   sudo pacman -Sy --noconfirm
 fi
 
-pkg_add winetricks
+# libxml2-legacy alongside winetricks, because Wine and Windows plugin
+# installers are what tend to need it.
+#
+# Arch's libxml2 2.15 bumped the soname: it now ships only libxml2.so.16, and
+# libxml2.so.2 is gone. libxml2-legacy exists purely to put that old soname
+# back. Anything that loads libxml2.so.2 at runtime with dlopen() keeps building
+# and installing fine and then fails only when it actually reaches that code
+# path -- and because a dlopen leaves no DT_NEEDED entry, neither ldd nor
+# pacman's dependency graph shows the gap beforehand.
+#
+# Reported from the field on this setup while creating a project; the exact
+# consumer was never pinned down, which is consistent with a dlopen. The package
+# is small and --needed makes it a no-op if something else already pulled it in,
+# so installing it unconditionally is cheaper than diagnosing it twice.
+pkg_add winetricks libxml2-legacy
 
 # Keep the wine-staging pin alive across Omarchy updates.
 #
@@ -482,20 +507,13 @@ case "$WINE_STRATEGY" in
       installed_wine_ver="$(wine --version 2>/dev/null | sed 's/^wine-//; s/ .*//' || true)"
       if [[ -n $installed_wine_ver ]] &&
         [[ $(vercmp "$installed_wine_ver" 9.22 2>/dev/null || echo 0) -lt 0 ]]; then
-        warn "Wine $installed_wine_ver is older than 9.22. Either upgrade it, or"
-        warn "use the default WINE_STRATEGY=pin with the released yabridge-bin."
+        warn "Wine $installed_wine_ver is older than 9.22. yabridge master drives"
+        warn "it fine, but Native Access needs current Wine -- consider upgrading."
       fi
     else
       pkg_add wine-staging
     fi
-    warn "WINE_STRATEGY=latest: you are on current Wine."
-    warn "The RELEASED yabridge (5.1.1) will have broken plugin editor windows."
-    warn "You need yabridge from master, which has merged Wine 10+ embedding."
-    warn "ni_yabridge_setup.sh installs it (yabridge-git/yabridgectl-git, both"
-    warn "maintained by yabridge's author and built from master HEAD):"
-    warn "  ./ni_yabridge_setup.sh"
-    warn "Or do it by hand:"
-    warn "  https://github.com/robbert-vdh/yabridge#installing-a-development-build"
+    echo "WINE_STRATEGY=latest: current Wine, with yabridge from master."
     ;;
 esac
 
@@ -512,32 +530,26 @@ fi
 # ------------------------------------------------------------------------------------
 notify "yabridge"
 
-# Verify the Wine we ended up with is one the released yabridge can drive.
-# vercmp is pacman's own version comparator: it prints 1 when $1 > $2.
 WINE_VER="$(wine --version 2>/dev/null | sed 's/^wine-//; s/ .*//' || true)"
-if [[ -n $WINE_VER ]]; then
-  echo "Wine version in use: $WINE_VER"
-  wine_cmp="$(vercmp "$WINE_VER" 9.21 2>/dev/null || echo 0)"
-  if [[ ${wine_cmp:-0} -gt 0 ]]; then
-    warn "Wine $WINE_VER is newer than 9.21, which the released yabridge"
-    warn "(5.1.1) cannot drive -- plugin editor windows will misbehave."
-    warn "Either re-run with the default WINE_STRATEGY=pin, or build yabridge"
-    warn "from master instead of installing yabridge-bin."
-  fi
-fi
+echo "Wine version in use: ${WINE_VER:-unknown}"
 
-if [[ $WINE_STRATEGY == "pin" ]]; then
-  aur_add yabridge-bin || warn "yabridge-bin install failed; skipping yabridge setup."
-else
-  # On 'latest', yabridge-bin is knowingly the wrong build, so don't install it
-  # over a master build the user may have put in place themselves.
-  if command -v yabridgectl &>/dev/null; then
-    echo "Using the yabridge already installed (expected: a master build)."
-  else
-    warn "No yabridge found. Install a master build before running yabridgectl:"
-    warn "  ./ni_yabridge_setup.sh   (also sets up Native Instruments)"
+# yabridge comes from upstream's own build artifacts, never the AUR. The
+# reasoning lives at the top of lib_yabridge.sh, which ni_yabridge_setup.sh
+# sources too, so both scripts install exactly the same build.
+#
+# On WINE_STRATEGY=pin the master build is still the right one to install: it
+# drives 9.21 as happily as it drives 11.x, and it is the only build that
+# survives a later Wine upgrade.
+# shellcheck source=lib_yabridge.sh
+if [[ -r $SCRIPT_DIR/lib_yabridge.sh ]]; then
+  source "$SCRIPT_DIR/lib_yabridge.sh"
+  install_yabridge_from_upstream ||
+    warn "yabridge install failed; re-run this script or install it by hand:"
+  command -v yabridgectl &>/dev/null ||
     warn "  https://github.com/robbert-vdh/yabridge#installing-a-development-build"
-  fi
+else
+  warn "lib_yabridge.sh not found next to this script; skipping yabridge."
+  warn "Expected at: $SCRIPT_DIR/lib_yabridge.sh"
 fi
 
 if command -v yabridgectl &>/dev/null; then
@@ -551,7 +563,9 @@ if command -v yabridgectl &>/dev/null; then
     mkdir -p "$dir"
     # `yabridgectl add` is already a no-op on a known path, but checking keeps
     # the output clean on re-runs.
-    if yabridgectl status 2>/dev/null | grep -Fq "$dir"; then
+    # Captured rather than piped into `grep -q`: under `set -o pipefail` a
+    # `grep -q` that exits on its first match can SIGPIPE the writer feeding it.
+    if [[ "$(yabridgectl status 2>/dev/null || true)" == *"$dir"* ]]; then
       echo "Already registered: $dir"
     else
       yabridgectl add "$dir"

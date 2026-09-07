@@ -279,15 +279,50 @@ FLATPAK_APPS=(
 # ── NVIDIA ────────────────────────────────────────────────────────────────────
 # =============================================================================
 
+# GPU detection mirrors Omarchy's own omarchy-hw-nvidia* helpers and defers to
+# them when present. The fallbacks below read the same cached sysfs IDs rather
+# than calling lspci, which reads PCI config space and resumes a runtime-
+# suspended GPU.
+#
+# The device-ID boundaries are upstream's: GSP firmware arrived with Turing,
+# which is also where IDs cross 0x1e00, and Maxwell opens at 0x1340, one ID
+# after the last Kepler part. Anything below that needs a legacy driver Arch no
+# longer packages -- hence a third "unsupported" outcome rather than a silent
+# fallback to the 580xx branch.
+#
+# Runs in a subshell so `shopt -s nullglob` cannot leak into the caller.
+_nvidia_sysfs_scan() { # <min-device-id> [<max-device-id, exclusive>]
+  local min=$1 max=${2:-}
+  (
+    shopt -s nullglob
+    for dev in "${OMARCHY_PCI_DEVICES_PATH:-/sys/bus/pci/devices}"/*; do
+      [[ -r $dev/vendor && -r $dev/class && -r $dev/device ]] || continue
+      [[ $(<"$dev/vendor") == 0x10de ]] || continue
+      [[ $(<"$dev/class") == 0x03* ]] || continue
+      id=$(<"$dev/device")
+      ((id >= min)) || continue
+      [[ -z $max ]] || ((id < max)) || continue
+      exit 0
+    done
+    exit 1
+  )
+}
+
 has_nvidia() {
-  if has_cmd omarchy-hw-nvidia; then omarchy-hw-nvidia && return 0 || return 1; fi
-  lspci 2>/dev/null | grep -qiE '(VGA|3D|Display).*NVIDIA'
+  has_cmd omarchy-hw-nvidia && { omarchy-hw-nvidia; return; }
+  _nvidia_sysfs_scan 0
 }
 
 # Turing (RTX 20xx) and newer ship GSP firmware and take the open modules.
 has_nvidia_gsp() {
-  if has_cmd omarchy-hw-nvidia-gsp; then omarchy-hw-nvidia-gsp && return 0 || return 1; fi
-  return 1
+  has_cmd omarchy-hw-nvidia-gsp && { omarchy-hw-nvidia-gsp; return; }
+  _nvidia_sysfs_scan $((0x1e00))
+}
+
+# Maxwell, Pascal and Volta: no GSP firmware, but still covered by 580xx.
+has_nvidia_without_gsp() {
+  has_cmd omarchy-hw-nvidia-without-gsp && { omarchy-hw-nvidia-without-gsp; return; }
+  _nvidia_sysfs_scan $((0x1340)) $((0x1e00))
 }
 
 setup_nvidia() {
@@ -315,9 +350,19 @@ setup_nvidia() {
   if has_nvidia_gsp; then
     info "GPU is Turing or newer (GSP firmware) — using the open modules."
     pkgs=(nvidia-open-dkms nvidia-utils lib32-nvidia-utils libva-nvidia-driver nvidia-settings)
+  elif has_nvidia_without_gsp; then
+    info "GPU is Maxwell/Pascal/Volta — using the 580xx legacy branch."
+    pkgs=(nvidia-580xx-dkms nvidia-580xx-utils lib32-nvidia-580xx-utils nvidia-settings)
   else
-    info "GPU predates Turing — using the 580xx legacy branch."
-    pkgs=(nvidia-580xx-dkms nvidia-580xx-utils lib32-nvidia-580xx-utils)
+    # Kepler and older. The 580xx branch does not support these, so installing
+    # it would put a driver on the system that cannot drive the card -- and the
+    # UKI rebuild further down would then hand a black screen to the next boot.
+    # Omarchy's own installer bails here for the same reason.
+    err "NVIDIA GPU detected, but it predates Maxwell and no packaged driver"
+    err "supports it. Leaving graphics alone; see"
+    err "https://wiki.archlinux.org/title/NVIDIA"
+    note_failure "nvidia (GPU too old for any packaged driver)"
+    return
   fi
   install_with_progress repo "${pkgs[@]}"
 
