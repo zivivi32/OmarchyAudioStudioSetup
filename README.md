@@ -7,6 +7,8 @@ Windows VST plugins via Wine + yabridge.
 | File | Purpose |
 | --- | --- |
 | `omarchy_audio_setup.sh` | The Omarchy version. **Use this one.** |
+| `ni_yabridge_setup.sh` | Native Instruments (Native Access) + yabridge, side by side. |
+| `ni_install_libraries.sh` | Mounts NI library `.iso` files and runs their installers. |
 | `arch_audio_setup.sh` | The original plain-Arch script, kept for reference. |
 
 ## Quick start
@@ -113,6 +115,120 @@ sudo sed -i '/^IgnorePkg = wine-staging$/d' /etc/pacman.conf   # or edit the lin
 sudo pacman -Syu
 ```
 
+## Native Instruments — `ni_yabridge_setup.sh`
+
+Sets up Native Access (via the `ni-wine` AUR package) so it coexists with
+yabridge, and registers the NI prefix so NI plugins reach your DAW.
+
+```bash
+WINE_STRATEGY=latest ./omarchy_audio_setup.sh
+./ni_yabridge_setup.sh
+sudo reboot
+```
+
+### It forces the `latest` branch, on purpose
+
+Native Access 2 is an Electron app, verified working on Wine 11.x and untested
+on 9.21. Pinning would also downgrade Wine underneath a prefix built with a
+newer one, and Wine prefixes do not downgrade cleanly.
+
+So the two halves of this repo pull in opposite directions, and NI wins: keep
+current Wine, and take yabridge from master instead of the 5.1.1 release.
+`omarchy_audio_setup.sh` now **refuses to pin** when `ni-wine` is installed,
+rather than silently breaking a working Native Access:
+
+```
+ni-wine is installed, and WINE_STRATEGY=pin would downgrade Wine to
+9.21-1 underneath your Native Access install.
+```
+
+Override with `NI_ACK_WINE_PIN=1` if you really want the pin.
+
+### The prefixes stay separate
+
+yabridge detects the Wine prefix per plugin, so plugins do **not** all have to
+live in one prefix — a common misconception. Native Access keeps `~/.wine-ni`
+and yabridgectl is simply pointed at it, which keeps `ni setup`'s wineboot,
+winetricks and registry tweaks out of your plugin prefix.
+
+What actually has to match is the Wine **version**: yabridge hosts every plugin
+with the system `wine`, whichever prefix it came from.
+
+| Prefix | Holds |
+| --- | --- |
+| `~/.wine-ni` | Native Access, NTKDaemon, NI plugins |
+| `~/.wine` | your other Windows VSTs (registered too, if it exists) |
+
+### It patches a bug in ni-wine
+
+`ni-wine` 2.1.3 hardcodes a Native Access download URL that NI retired. It now
+301-redirects to an HTML landing page, and `download()` never checks the content
+type — so ~1 MB of HTML gets saved as `Native-Access_2.exe`, handed to Wine with
+`check=False`, and the failed install passes silently. Setup only notices one
+step later and dies with a message pointing at the wrong thing entirely:
+
+```
+error: NTKDaemon installer not found under .../resources/daemon/win
+```
+
+The daemon is not the problem; Native Access was never installed at all. The
+script repoints the URL at NI's current Google Cloud Storage location, verifies
+it still serves a binary before applying it, and drops the poisoned cache entry.
+
+Because the patch edits a **pacman-owned file**, a plain `sed` would be reverted
+by the next `pacman -Syu` and the same misleading error would come back with no
+obvious cause. So it is installed as a hook instead:
+
+| Path | Purpose |
+| --- | --- |
+| `/usr/local/bin/ni-wine-url-fix` | Re-applies the URL fix; globs `python3*` so a Python upgrade doesn't strand it |
+| `/etc/pacman.d/hooks/95-ni-wine-url-fix.hook` | Runs it `PostTransaction` on every `ni-wine` install/upgrade |
+
+This is worth reporting upstream at
+[selimbucher/native-instruments](https://github.com/selimbucher/native-instruments) —
+the dead URL, plus the two bugs that turned it into a misleading error (the
+unvalidated download content type, and `check=False` on the installer run).
+
+### Caveats
+
+- **The 32-bit bitbridge will not work.** Arch's Wine is now a WoW64 build with
+  no `wine64` binary, which yabridge's bitbridge
+  [cannot support](https://bugs.winehq.org/show_bug.cgi?id=58377). Only 32-bit
+  plugins are affected; Kontakt and current NI products are 64-bit.
+- **yabridge comes from upstream, never the AUR.** Both `yabridge` and
+  `yabridgectl` are taken from the build artifacts of
+  [robbert-vdh/yabridge](https://github.com/robbert-vdh/yabridge)'s own GitHub
+  Actions workflow, landing in `~/.local/share/yabridge` and `~/.local/bin`.
+  The script prefers `gh` (straight to `api.github.com`) when you are logged in,
+  and otherwise falls back to [nightly.link](https://nightly.link), a
+  third-party proxy for GitHub's artifact endpoint — GitHub requires
+  authentication to download artifacts at all, and nightly.link serves the bytes
+  itself rather than redirecting, so it is trusted infrastructure in that chain.
+  Both routes end at the same artifact from the same upstream run.
+  The last tagged release (5.1.1, Nov 2024) predates Wine 10 editor embedding
+  and breaks on Wine 9.22+, so master is what is wanted, and master ships only
+  as a CI artifact.
+- **Remove any AUR yabridge first.** `yabridge-git` and `yabridge-bin` install
+  into `/usr/lib`, which yabridgectl prefers over `~/.local/share`, and
+  `/usr/bin` precedes `~/.local/bin` on the default Arch `PATH` — so an AUR
+  build silently wins over the upstream one. The script detects this and prints
+  the `pacman -Rns` line; it will not remove packages on your behalf.
+- **On Wine 11, yabridge cannot be compiled at all** — the script installs
+  upstream's prebuilt binaries instead. Wine's Unix-side import libraries
+  (`/usr/lib/wine/x86_64-unix/lib*.a`) are full of references to
+  `__wine$func$<dll>$<ordinal>$<name>` placeholder symbols that `winebuild` is
+  supposed to resolve at link time. On Arch's `wine 11.16` nothing defines them
+  (1236 references in `libkernel32.a` alone, zero definitions anywhere), and
+  `winebuild` only emits thunks for a handful of CRT entry points, so linking
+  `yabridge-host.exe.so` dies with ~200 `undefined reference to __wine$func$...`
+  errors. Both the 64-bit host and the bitbridge fail, so `-Dbitbridge=false`
+  does not help. The script detects this and pulls the
+  upstream artifact for the *same commit* — linked in yabridge's CI against a
+  Wine whose import libraries still work — then verifies `yabridge-host.exe`
+  actually starts under the local Wine before continuing.
+- **Re-run `yabridgectl sync` after installing any NI product.** New plugins are
+  not bridged until you do.
+
 ## What it changes
 
 **System files** (each written idempotently; `.bak` copies are timestamped):
@@ -161,9 +277,13 @@ Then re-run `yabridgectl sync`. You need to do this after every new plugin.
 - **Pinning a Nov-2024 Wine onto current Arch can hit dependency drift.** If
   `pacman -U` fails, the script says so and prints the fallbacks rather than
   dying silently.
-- **`yabridge-git` is not installed automatically.** Its AUR PKGBUILD has not
-  been touched since 2022, so it is not a safe unattended install even though
-  master itself is current.
+- **No AUR yabridge package is used by either script.** `yabridge-git` is
+  maintained by yabridge's own author and does build master HEAD (the 2022
+  `pkgver` on the AUR page is just a stale cached value, recomputed from
+  `git describe` at build time) — but on Wine 11 it cannot link, and upstream's
+  own artifacts are the more direct source regardless. If you have
+  `yabridge-git`, `yabridge-bin` or `yabridgectl-git` installed, remove them so
+  they stop shadowing the upstream build.
 - **`WINE_STRATEGY=latest` may be rough on Wayland.** yabridge
   [issue #488](https://github.com/robbert-vdh/yabridge/issues/488) reports a
   VST3 editor crash on close under Wine 11.12 on Wayland, and Omarchy is

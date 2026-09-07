@@ -114,6 +114,36 @@ if [[ $WINE_STRATEGY != "pin" && $WINE_STRATEGY != "latest" ]]; then
   exit 1
 fi
 
+# Native Instruments and the Wine pin pull in opposite directions.
+#
+# Native Access 2 is an Electron app; it is verified working on Wine 11.x and is
+# untested on 9.21. Pinning would also downgrade Wine underneath a prefix that
+# was built with a newer one, and Wine prefixes do not downgrade cleanly. So if
+# ni-wine is installed, refuse to pin rather than quietly breaking a working
+# Native Access -- which would show up much later as an unexplained failure.
+#
+# ni_yabridge_setup.sh deliberately takes the other branch: keep current Wine and
+# build yabridge from master, which has merged Wine 10+ editor embedding.
+if [[ $WINE_STRATEGY == "pin" ]] && command -v ni &>/dev/null; then
+  if [[ ${NI_ACK_WINE_PIN:-0} != 1 ]]; then
+    echo "ni-wine is installed, and WINE_STRATEGY=pin would downgrade Wine to" >&2
+    echo "$WINE_PIN_VERSION underneath your Native Access install." >&2
+    echo >&2
+    echo "Native Access is verified on Wine 11.x and untested on 9.21, and the" >&2
+    echo "existing prefix was built with the newer Wine." >&2
+    echo >&2
+    echo "Either keep current Wine and get yabridge from master (recommended):" >&2
+    echo "    WINE_STRATEGY=latest $0" >&2
+    echo "    ./ni_yabridge_setup.sh" >&2
+    echo >&2
+    echo "...or pin anyway, accepting that Native Access may break:" >&2
+    echo "    NI_ACK_WINE_PIN=1 $0" >&2
+    exit 1
+  fi
+  warn "NI_ACK_WINE_PIN=1: pinning Wine to $WINE_PIN_VERSION even though"
+  warn "ni-wine is installed. Native Access may stop working."
+fi
+
 # Ask for sudo once up front and keep the timestamp alive for the long
 # package/download steps, so the script doesn't stall waiting for a password.
 sudo -v
@@ -435,10 +465,36 @@ case "$WINE_STRATEGY" in
     fi
     ;;
   latest)
-    pkg_add wine-staging
-    warn "WINE_STRATEGY=latest: you are on current wine-staging."
+    # Only install wine-staging if there is no Wine at all.
+    #
+    # wine-staging Conflicts With wine, so on a box running the plain `wine`
+    # package pacman would have to remove it first -- and --noconfirm answers
+    # that conflict prompt with its default (No), aborting the transaction and
+    # taking the rest of this script with it.
+    #
+    # Forcing the swap also has no upside here: yabridge master drives plain
+    # wine and wine-staging alike, and replacing Wine underneath an existing
+    # Native Access prefix is a risk for no benefit. Install wine-staging by
+    # hand if you specifically want the staging patches:
+    #   sudo pacman -S wine-staging      (answer 'y' to remove wine)
+    if command -v wine &>/dev/null; then
+      echo "Wine already installed: $(wine --version 2>/dev/null). Leaving it alone."
+      installed_wine_ver="$(wine --version 2>/dev/null | sed 's/^wine-//; s/ .*//' || true)"
+      if [[ -n $installed_wine_ver ]] &&
+        [[ $(vercmp "$installed_wine_ver" 9.22 2>/dev/null || echo 0) -lt 0 ]]; then
+        warn "Wine $installed_wine_ver is older than 9.22. Either upgrade it, or"
+        warn "use the default WINE_STRATEGY=pin with the released yabridge-bin."
+      fi
+    else
+      pkg_add wine-staging
+    fi
+    warn "WINE_STRATEGY=latest: you are on current Wine."
     warn "The RELEASED yabridge (5.1.1) will have broken plugin editor windows."
-    warn "Build yabridge from master, which has merged Wine 10 embedding support:"
+    warn "You need yabridge from master, which has merged Wine 10+ embedding."
+    warn "ni_yabridge_setup.sh installs it (yabridge-git/yabridgectl-git, both"
+    warn "maintained by yabridge's author and built from master HEAD):"
+    warn "  ./ni_yabridge_setup.sh"
+    warn "Or do it by hand:"
     warn "  https://github.com/robbert-vdh/yabridge#installing-a-development-build"
     ;;
 esac
@@ -479,6 +535,7 @@ else
     echo "Using the yabridge already installed (expected: a master build)."
   else
     warn "No yabridge found. Install a master build before running yabridgectl:"
+    warn "  ./ni_yabridge_setup.sh   (also sets up Native Instruments)"
     warn "  https://github.com/robbert-vdh/yabridge#installing-a-development-build"
   fi
 fi
