@@ -1,27 +1,75 @@
 #!/usr/bin/env bash
 # =============================================================================
-# setup_system.sh  —  CachyOS / Arch minimal system setup
+# omarchy_system_setup.sh  —  Omarchy system setup
 # Gaming · Game Development · Music Production (prep)
 #
-# HOW TO USE:
-#   • Comment out any line in PACMAN_PKGS or AUR_PKGS or FLATPAK_APPS to skip it
-#   • Add new packages the same way — pacman name, AUR name, or Flatpak app ID
-#   • paru is used for AUR packages (CachyOS default). If missing it will be
-#     installed automatically from the AUR using a temporary makepkg build.
+# Omarchy port of system_setup_arch.sh (which targeted CachyOS/Arch + KDE).
+# Tuned for an NVIDIA machine.
 #
-# ⚠  Run this BEFORE linux_audio_studio_setup.sh
+# HOW TO USE:
+#   • Comment out any line in PACMAN_PKGS / AUR_PKGS / OMARCHY_APPS / FLATPAK_APPS
+#     to skip it. Add new ones the same way.
 #
 # Usage:
-#   ./setup_system.sh          # full install
-#   ./setup_system.sh -n       # dry-run
+#   ./omarchy_system_setup.sh          # full install
+#   ./omarchy_system_setup.sh -n       # dry-run, changes nothing
+#
+#   SETUP_ZSH=1 ./omarchy_system_setup.sh    # also switch the login shell to zsh
+#
+# ⚠  Run this BEFORE omarchy_audio_setup.sh
+#
+# -----------------------------------------------------------------------------
+# WHAT CHANGED FROM THE ARCH/CACHYOS VERSION, AND WHY
+#
+# NVIDIA is delegated to Omarchy's own hardware detection instead of being
+# hardcoded. The original pinned `nvidia-dkms` for everyone and never installed
+# kernel headers, so the DKMS build had nothing to build against. Omarchy
+# already ships the logic to pick the right branch, and this script reuses it:
+#   Turing or newer (GSP)  -> nvidia-open-dkms + nvidia-utils + libva-nvidia-driver
+#   Maxwell/Pascal/Volta   -> nvidia-580xx-dkms + nvidia-580xx-utils
+# It also writes the early-KMS modprobe and mkinitcpio drop-ins, and -- the part
+# that is easy to miss on Omarchy -- rebuilds the UKI with `limine-mkinitcpio`,
+# because Omarchy boots Limine + a Unified Kernel Image rather than GRUB.
+# Hyprland's NVIDIA env vars are NOT set here: Omarchy's default/hypr/nvidia.lua
+# already applies them per session when it detects the card.
+#
+# paru -> yay. Omarchy ships yay; installs go through omarchy-pkg-add /
+# omarchy-pkg-aur-add, which are idempotent and verify the package landed.
+#
+# The KDE block is gone. Omarchy is Hyprland, and pulling in spectacle,
+# plasma-systemmonitor, filelight and kfind drags half of Qt/KDE onto a machine
+# that already has btop, hyprshot/grim+slurp, nautilus and dua-cli.
+#
+# timeshift is gone. Omarchy snapshots with snapper + limine-snapper-sync,
+# already wired into the boot menu. A second snapshot manager on the same Btrfs
+# root is a good way to lose both.
+#
+# The LazyVim block is gone. Omarchy ships omarchy-nvim, which IS LazyVim,
+# already configured. The original moved ~/.config/nvim to .bak and replaced it
+# with the upstream starter -- that silently throws away Omarchy's setup.
+#
+# The zsh switch is opt-in (SETUP_ZSH=1). Omarchy is a bash desktop with its own
+# prompt and shell config; chsh'ing to zsh by default leaves you outside it.
+#
+# UFW is verified, not reconfigured. Omarchy already sets deny-in/allow-out,
+# opens LocalSend, and installs the ufw-docker rules.
+#
+# p7zip -> 7zip (p7zip was dropped from the Arch repos).
+# realtime-privileges moved from AUR to the pacman list; it is in [extra] now.
+# Most of the Flatpak list became native packages -- Omarchy's own repo carries
+# 1password, heroic, localsend and spotify, and discord/krita/godot/obsidian/
+# flatseal are all in [extra]. Native means themed, faster, and no portal
+# surprises. Flatpak is only installed if FLATPAK_APPS is non-empty.
 # =============================================================================
 
 set -uo pipefail
+
 DRY_RUN=false
 [[ "${1:-}" == "-n" || "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+SETUP_ZSH="${SETUP_ZSH:-0}"
 
-LOG="$HOME/setup_system_$(date +%Y%m%d_%H%M%S).log"
-echo "" >"$LOG"
+LOG="$HOME/omarchy_system_setup_$(date +%Y%m%d_%H%M%S).log"
+: >"$LOG"
 
 # Colours
 if [ -t 1 ]; then
@@ -32,20 +80,22 @@ log() { echo -e "$*" | tee -a "$LOG"; }
 info() { log "${C}  ➜  $*${R}"; }
 ok() { log "${G}  ✔  $*${R}"; }
 warn() { log "${Y}  ⚠  $*${R}"; }
+err() { log "${RED}  ✘  $*${R}"; }
 section() {
   log
   log "${BOLD}── $* ──${R}"
 }
+
+# Anything that could not be installed lands here and is replayed at the end,
+# so a 200-package run doesn't hide three failures in the scrollback.
+FAILED=()
+note_failure() { FAILED+=("$1"); }
+
 run() { $DRY_RUN && log "  [dry-run] $*" || eval "$*" >>"$LOG" 2>&1; }
+
 append_once() {
   touch "$2"
   grep -qxF "$1" "$2" || echo "$1" >>"$2"
-}
-in_list() {
-  local t="$1"
-  shift
-  for i in "$@"; do [[ "$i" == "$t" ]] && return 0; done
-  return 1
 }
 
 print_list() {
@@ -56,53 +106,57 @@ print_list() {
   done
 }
 
-# pacman install — one at a time with [N/total] counter
-pacman_install_with_progress() {
-  local total=$#
-  local i=1
-  for pkg in "$@"; do
-    log
-    log "  ${BOLD}[${i}/${total}]${R} ${C}${pkg}${R}"
-    if $DRY_RUN; then
-      log "  [dry-run] sudo pacman -S --noconfirm --needed $pkg"
-    else
-      sudo pacman -S --noconfirm --needed "$pkg" 2>&1 | tee -a "$LOG" ||
-        warn "Failed to install $pkg, skipping..."
-    fi
-    ((i++))
-  done
+pacman_installed() { pacman -Qi "$1" &>/dev/null; }
+has_cmd() { command -v "$1" &>/dev/null; }
+
+# --- package helpers ---------------------------------------------------------
+# omarchy-pkg-add is idempotent, uses --needed, and re-checks with `pacman -Q`
+# afterwards, so a package that silently fails to install is still reported.
+
+pkg_add_one() {
+  local pkg=$1
+  if $DRY_RUN; then
+    log "  [dry-run] install $pkg"
+    return 0
+  fi
+  if has_cmd omarchy-pkg-add; then
+    omarchy-pkg-add "$pkg" >>"$LOG" 2>&1
+  else
+    sudo pacman -S --noconfirm --needed "$pkg" >>"$LOG" 2>&1
+  fi
 }
 
-# paru (AUR) install — one at a time with [N/total] counter
-aur_install_with_progress() {
-  local total=$#
-  local i=1
-  for pkg in "$@"; do
-    log
-    log "  ${BOLD}[${i}/${total}]${R} ${C}${pkg}${R} ${Y}(AUR)${R}"
-    if $DRY_RUN; then
-      log "  [dry-run] paru -S --noconfirm --needed $pkg"
-    else
-      paru -S --noconfirm --needed "$pkg" 2>&1 | tee -a "$LOG" ||
-        warn "Failed to install AUR pkg $pkg, skipping..."
-    fi
-    ((i++))
-  done
+aur_add_one() {
+  local pkg=$1
+  if $DRY_RUN; then
+    log "  [dry-run] install $pkg (AUR)"
+    return 0
+  fi
+  if has_cmd omarchy-pkg-aur-add; then
+    omarchy-pkg-aur-add "$pkg" >>"$LOG" 2>&1
+  elif has_cmd yay; then
+    yay -S --noconfirm --needed "$pkg" >>"$LOG" 2>&1
+  else
+    return 1
+  fi
 }
 
-# Flatpak install with [N/total] counter — one app at a time
-flatpak_install_with_progress() {
-  local total=$#
-  local i=1
-  for app in "$@"; do
-    log
-    log "  ${BOLD}[${i}/${total}]${R} ${C}${app}${R}"
-    if $DRY_RUN; then
-      log "  [dry-run] flatpak install -y flathub $app"
+install_with_progress() { # install_with_progress <repo|aur> <pkgs...>
+  local kind=$1
+  shift
+  local total=$# i=1 tag=""
+  [[ $kind == aur ]] && tag=" ${Y}(AUR)${R}"
+  for pkg in "$@"; do
+    if pacman_installed "$pkg"; then
+      log "  ${BOLD}[${i}/${total}]${R} ${pkg} — ${G}already installed${R}"
+      ((i++))
+      continue
+    fi
+    log "  ${BOLD}[${i}/${total}]${R} ${C}${pkg}${R}${tag}"
+    if [[ $kind == aur ]]; then
+      aur_add_one "$pkg" || { warn "Failed: $pkg (AUR) — skipping"; note_failure "AUR $pkg"; }
     else
-      flatpak install --or-update -y flathub "$app" 2>&1 | tee -a "$LOG" |
-        grep --line-buffered -E '(Installing|Updating|Already|Error)' |
-        while IFS= read -r line; do echo "    $line"; done
+      pkg_add_one "$pkg" || { warn "Failed: $pkg — skipping"; note_failure "pkg $pkg"; }
     fi
     ((i++))
   done
@@ -112,141 +166,207 @@ flatpak_install_with_progress() {
 # ── EDIT THESE LISTS ─────────────────────────────────────────────────────────
 # =============================================================================
 
-# Official repo packages (pacman)
+# Official repo packages. Anything Omarchy already ships (bat, eza, fzf, fd,
+# ripgrep, btop, fastfetch, zoxide, tmux, wl-clipboard, jq, ffmpeg, neovim,
+# starship, ufw, unzip, alsa-utils, base-devel, noto-fonts-emoji, poppler,
+# chromium, docker, obsidian, localsend, nautilus, mpv, obs-studio, kdenlive)
+# is deliberately absent — it is already there.
 PACMAN_PKGS=(
   # ── Safety ────────────────────────────────────────────────────────────
-  ufw # firewall
-  timeshift
+  # ufw ships and is already enabled by Omarchy; snapper replaces timeshift.
+
   # ── System ────────────────────────────────────────────────────────────
-  irqbalance # distributes IRQs across CPU cores
-  cpupower   # inspect/set CPU governor manually
-  alsa-utils # alsamixer — needed by audio script setup notes
+  irqbalance          # distributes IRQs across CPU cores
+  cpupower            # inspect/set CPU governor manually
+  realtime-privileges # 'realtime' group + rtprio/memlock limits (in [extra] now)
 
   # ── Build tools ───────────────────────────────────────────────────────
-  base-devel # gcc, g++, make, and friends
   cmake
   ninja
   meson
-  pkgconf
   python-pip
   python-virtualenv
-  jq # JSON in scripts
   openssl
   libffi
 
-  # ── Archives + codecs ─────────────────────────────────────────────────
-  p7zip
+  # ── Archives ──────────────────────────────────────────────────────────
+  7zip # replaces p7zip, which was dropped from the Arch repos
   unrar
   zip
-  unzip
-  ffmpeg # implicit dep of many tools and exporters
 
   # ── Fonts ─────────────────────────────────────────────────────────────
-  noto-fonts-emoji # prevents emoji rendering as empty squares
-  ttf-jetbrains-mono
+  ttf-jetbrains-mono # Omarchy ships the Nerd Font variant; this is the plain one
 
   # ── GPU / Vulkan ──────────────────────────────────────────────────────
-  # NOTE: NVIDIA users — uncomment the nvidia block, comment out the mesa block
-  # NVIDIA:
-  nvidia-dkms
-  nvidia-utils
-  lib32-nvidia-utils
-  nvidia-settings
-  # Mesa / AMD / Intel:
-  #mesa
-  #lib32-mesa
-  #vulkan-radeon           # AMD — swap for vulkan-intel if on Intel iGPU
-  #lib32-vulkan-radeon     # AMD 32-bit — swap for lib32-vulkan-intel if needed
-  #vulkan-intel
-  #lib32-vulkan-intel
-  #mesa-utils
+  # The NVIDIA driver itself is NOT listed here — see setup_nvidia() below,
+  # which picks the right branch for your card. These are vendor-neutral.
   vulkan-icd-loader
   lib32-vulkan-icd-loader
-  vulkan-tools
-  vulkan-headers
+  vulkan-tools # vulkaninfo, vkcube
 
   # ── Gaming ────────────────────────────────────────────────────────────
-  steam
+  # steam is installed via OMARCHY_APPS so it also pulls the lib32 GPU drivers.
   gamemode       # CPU/IO optimiser while gaming — use: gamemoderun %command%
   lib32-gamemode # 32-bit Steam games need this
   mangohud       # in-game overlay — use: MANGOHUD=1 %command%
-  lib32-mangohud # 32-bit support
-
-  # libgl1-mesa-dev / libegl1-mesa-dev equivalents are included in mesa
+  lib32-mangohud
 
   # ── Productivity ──────────────────────────────────────────────────────
-  poppler   # provides pdfunite and other PDF tools
-  qemu-full # replaces qemu-kvm + extras
+  qemu-full
   libvirt
   virt-manager
   bridge-utils
-  virt-install
   vlc
 
-  # ── Neovim ────────────────────────────────────────────────────────────
-  neovim  # always up to date in Arch repos — no PPA needed
-  ripgrep # LazyVim live grep
-  fd      # LazyVim file finder — no rename needed on Arch
+  # ── Game dev / creative ───────────────────────────────────────────────
+  # NOTE: this is a single Godot version, not the Godots version manager the
+  # Flatpak list used. If you juggle several Godot versions, keep Godots as a
+  # Flatpak (io.github.MakovWait.Godots) and drop this line.
+  godot
+  krita
+
+  # ── Chat / notes ──────────────────────────────────────────────────────
+  discord  # native package, was com.discordapp.Discord on Flatpak
+  obsidian # in Omarchy's base list, kept here so a trimmed install gets it too
+
+  # ── Neovim extras ─────────────────────────────────────────────────────
+  # neovim + LazyVim already ship as omarchy-nvim. These are its helpers.
   nodejs
   npm
-  xclip # system clipboard for Neovim
 
   # ── Shell + terminal ──────────────────────────────────────────────────
-  zsh
-  zoxide # smarter cd — learns your directories
-  tmux
+  # Omarchy is bash + starship. zsh is only installed if you asked for it.
 
   # ── CLI utils ─────────────────────────────────────────────────────────
   htop
-  btop      # process monitor with GPU support
-  fastfetch # system info display
-  ncdu      # interactive disk usage
+  ncdu
   tree
-  duf          # modern df
-  bat          # cat with syntax highlighting — no alias needed on Arch
-  eza          # modern ls with git info
-  fzf          # fuzzy finder + Ctrl+R / Ctrl+T shell keybindings
-  wl-clipboard # Wayland clipboard (wl-copy / wl-paste)
-
-  # ── KDE ───────────────────────────────────────────────────────────────
-  plasma-systemmonitor # task manager with GPU usage
-  spectacle            # screenshot tool
-  filelight            # visual disk usage map
-  kfind
-  #kdeconnect
+  duf # modern df
 
   # ── Network ───────────────────────────────────────────────────────────
-  net-tools # ifconfig, netstat
-  mtr       # better traceroute (mtr-tiny on Ubuntu = mtr on Arch)
+  net-tools
+  mtr
   nmap
-  brave
 )
 
-# AUR packages (paru)
+# zsh only matters if you opted in.
+[[ $SETUP_ZSH == 1 ]] && PACMAN_PKGS+=(zsh)
+
+# AUR packages (via yay / omarchy-pkg-aur-add).
 AUR_PKGS=(
-  #timeshift               # system snapshots — run it before anything else
-  realtime-privileges # creates 'realtime' group + rtprio/memlock limits
-  unityhub            # Unity game engine launcher
-  1password           # password manager
+  unityhub # Unity game engine launcher — no repo version exists
 )
 
+# Installed through Omarchy's own installers, which do more than `pacman -S`:
+# the gaming ones also pull the matching lib32 GPU drivers for your card, and
+# 1password wires up its Chromium extension.
+OMARCHY_APPS=(
+  gaming-steam    # steam + lib32 GPU drivers
+  gaming-heroic   # Epic + GOG + Amazon
+  service-1password
+  service-spotify
+)
+
+# Flatpak is NOT installed unless this list is non-empty. Everything that used
+# to be here has a native package on Omarchy; only add things that genuinely
+# have no repo build.
 FLATPAK_APPS=(
-  # ── Gaming ────────────────────────────────────────────────────────────
-  com.heroicgameslauncher.hgl # Epic + GOG launcher
-  com.discordapp.Discord
-  com.usebottles.bottles # Windows apps via Wine (isolated from audio Wine)
-
-  # ── Game dev ──────────────────────────────────────────────────────────
-  io.github.MakovWait.Godots # Godot version manager
-  org.kde.krita              # 2D painting + texture work
-
-  # ── Productivity ──────────────────────────────────────────────────────
-  #com.brave.Browser
-  md.obsidian.Obsidian
-  org.localsend.localsend_app
-  com.github.tchx84.Flatseal # Flatpak permissions manager
-  com.spotify.Client
+  #com.usebottles.bottles          # Windows apps, isolated from the audio Wine prefix
+  #io.github.MakovWait.Godots      # Godot version manager (see the godot note above)
 )
+
+# =============================================================================
+# ── NVIDIA ────────────────────────────────────────────────────────────────────
+# =============================================================================
+
+has_nvidia() {
+  if has_cmd omarchy-hw-nvidia; then omarchy-hw-nvidia && return 0 || return 1; fi
+  lspci 2>/dev/null | grep -qiE '(VGA|3D|Display).*NVIDIA'
+}
+
+# Turing (RTX 20xx) and newer ship GSP firmware and take the open modules.
+has_nvidia_gsp() {
+  if has_cmd omarchy-hw-nvidia-gsp; then omarchy-hw-nvidia-gsp && return 0 || return 1; fi
+  return 1
+}
+
+setup_nvidia() {
+  section "NVIDIA"
+
+  if ! has_nvidia; then
+    ok "No NVIDIA GPU detected — skipping the whole NVIDIA section."
+    return
+  fi
+
+  local rebuild_uki=false
+
+  # DKMS needs headers for the running kernel. The original script installed
+  # nvidia-dkms without them, so the module never built.
+  local kernel_pkg
+  kernel_pkg=$(pacman -Qqs '^linux(-zen|-lts|-hardened|-t2|-ptl)?$' 2>/dev/null | head -1)
+  if [[ -n $kernel_pkg ]]; then
+    info "Installing ${kernel_pkg}-headers for the DKMS build..."
+    pkg_add_one "${kernel_pkg}-headers" || note_failure "pkg ${kernel_pkg}-headers"
+  else
+    warn "Could not identify the kernel package; install <kernel>-headers by hand."
+  fi
+
+  local -a pkgs
+  if has_nvidia_gsp; then
+    info "GPU is Turing or newer (GSP firmware) — using the open modules."
+    pkgs=(nvidia-open-dkms nvidia-utils lib32-nvidia-utils libva-nvidia-driver nvidia-settings)
+  else
+    info "GPU predates Turing — using the 580xx legacy branch."
+    pkgs=(nvidia-580xx-dkms nvidia-580xx-utils lib32-nvidia-580xx-utils)
+  fi
+  install_with_progress repo "${pkgs[@]}"
+
+  # Early KMS. Without modeset=1 you get a black screen or a torn handoff into
+  # Hyprland on Wayland.
+  local modprobe_conf=/etc/modprobe.d/nvidia.conf
+  if [[ -f $modprobe_conf ]] && grep -q 'nvidia_drm modeset=1' "$modprobe_conf"; then
+    ok "modprobe early-KMS already configured."
+  else
+    info "Writing $modprobe_conf (nvidia_drm modeset=1)..."
+    run "printf 'options nvidia_drm modeset=1\n' | sudo tee '$modprobe_conf' >/dev/null"
+    rebuild_uki=true
+  fi
+
+  local mkinit_conf=/etc/mkinitcpio.conf.d/nvidia.conf
+  if [[ -f $mkinit_conf ]] && grep -q 'nvidia_drm' "$mkinit_conf"; then
+    ok "mkinitcpio NVIDIA modules already configured."
+  else
+    info "Writing $mkinit_conf (early module load)..."
+    run "sudo mkdir -p /etc/mkinitcpio.conf.d"
+    run "printf 'MODULES+=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)\n' | sudo tee '$mkinit_conf' >/dev/null"
+    rebuild_uki=true
+  fi
+
+  # THE Omarchy-specific step. Omarchy boots Limine + a UKI, so the modules and
+  # kernel command line only take effect once the UKI is rebuilt. On plain Arch
+  # a bare `mkinitcpio -P` would do; here it has to go through Limine's hook.
+  if $rebuild_uki; then
+    if has_cmd limine-mkinitcpio; then
+      info "Rebuilding the initramfs / UKI so early KMS takes effect..."
+      run "sudo limine-mkinitcpio"
+      ok "UKI rebuilt."
+    elif has_cmd mkinitcpio; then
+      warn "limine-mkinitcpio not found — falling back to mkinitcpio -P."
+      run "sudo mkinitcpio -P"
+    else
+      err "No way to rebuild the initramfs. Run 'sudo limine-mkinitcpio' by hand."
+      note_failure "initramfs rebuild"
+    fi
+  else
+    ok "NVIDIA boot configuration already in place — no UKI rebuild needed."
+  fi
+
+  # Deliberately NOT setting LIBVA_DRIVER_NAME / __GLX_VENDOR_LIBRARY_NAME:
+  # Omarchy's default/hypr/nvidia.lua sets them per session when it detects the
+  # card, and a second copy in a shell rc only drifts out of date.
+  ok "Hyprland NVIDIA env vars are handled by Omarchy — nothing to add."
+  warn "NVIDIA: reboot required before the driver is actually in use."
+}
 
 # =============================================================================
 # ── POST-INSTALL CONFIG ───────────────────────────────────────────────────────
@@ -255,101 +375,99 @@ FLATPAK_APPS=(
 post_install() {
   section "Post-install configuration"
 
-  # UFW
-  if command -v ufw &>/dev/null; then
-    info "Configuring UFW..."
-    run "sudo ufw default deny incoming"
-    run "sudo ufw default allow outgoing"
-    run "sudo ufw allow 1714:1764/udp" # KDE Connect
-    run "sudo ufw allow 1714:1764/tcp"
-    # LocalSend
-    run "sudo ufw allow 53317/tcp"
-    run "sudo ufw allow 53317/udp"
-    run "sudo ufw --force enable"
-    ok "UFW enabled."
+  # --- UFW ---
+  # Omarchy already sets deny-in/allow-out, opens LocalSend (53317) and installs
+  # the ufw-docker rules. Don't re-run `ufw --force enable` over that; just say
+  # what the state is.
+  if has_cmd ufw; then
+    if systemctl is-enabled ufw &>/dev/null; then
+      ok "UFW is enabled (configured by Omarchy: deny in, allow out, LocalSend open)."
+    else
+      info "Enabling UFW..."
+      run "sudo ufw default deny incoming"
+      run "sudo ufw default allow outgoing"
+      run "sudo ufw allow 53317/tcp" # LocalSend
+      run "sudo ufw allow 53317/udp"
+      run "sudo ufw --force enable"
+      ok "UFW enabled."
+    fi
   fi
 
-  # Kernel params
+  # --- Steam / Proton map count ---
+  # Omarchy's own sysctl drop-in is 99-omarchy-sysctl.conf and does not set
+  # this; a separate file keeps an Omarchy update from clobbering it.
   local sysctl_file="/etc/sysctl.d/99-gaming-performance.conf"
-  if [ ! -f "$sysctl_file" ]; then
-    info "Setting vm.max_map_count (Steam/Proton)..."
-    run "echo 'vm.max_map_count=2147483642' | sudo tee '$sysctl_file' > /dev/null"
-    run "sudo sysctl -p '$sysctl_file'"
+  if [ -f "$sysctl_file" ]; then
+    ok "vm.max_map_count already configured."
+  else
+    info "Setting vm.max_map_count for Steam/Proton..."
+    run "sudo mkdir -p /etc/sysctl.d"
+    run "echo 'vm.max_map_count=2147483642' | sudo tee '$sysctl_file' >/dev/null"
+    run "sudo sysctl --system >/dev/null"
   fi
 
-  # irqbalance
-  command -v irqbalance &>/dev/null && run "sudo systemctl enable --now irqbalance"
-
-  # NVIDIA — only if nvidia-dkms was installed
-  if pacman_installed nvidia-dkms; then
-    warn "NVIDIA: reboot required after first boot to load the driver."
+  # --- irqbalance ---
+  if pacman_installed irqbalance; then
+    run "sudo systemctl enable --now irqbalance"
+    ok "irqbalance enabled."
   fi
 
-  # Realtime + audio groups
+  # --- Groups ---
+  # realtime-privileges gives @realtime rtprio/memlock. omarchy_audio_setup.sh
+  # separately configures @audio; being in both is fine and complementary.
   if pacman_installed realtime-privileges; then
     run "sudo usermod -aG realtime,audio '$USER'"
     warn "Group change (realtime, audio): takes effect on next login."
   fi
 
-  # GameMode group
-  if command -v gamemoded &>/dev/null && getent group gamemode &>/dev/null; then
+  if has_cmd gamemoded && getent group gamemode &>/dev/null; then
     run "sudo usermod -aG gamemode '$USER'"
     ok "Added to gamemode group. Steam launch option: gamemoderun %command%"
   fi
 
-  # virt-manager
   if pacman_installed virt-manager; then
     run "sudo usermod -aG libvirt,kvm '$USER'"
     run "sudo systemctl enable --now libvirtd"
-    $DRY_RUN || sudo virsh net-autostart default 2>/dev/null || true
+    $DRY_RUN || sudo virsh net-autostart default &>/dev/null || true
     warn "Group change (libvirt, kvm): takes effect on next login."
   fi
 
-  # LazyVim
-  if command -v nvim &>/dev/null; then
-    local nvim_cfg="$HOME/.config/nvim"
-    if [ ! -f "$nvim_cfg/lua/config/lazy.lua" ]; then
-      for d in "$nvim_cfg" "$HOME/.local/share/nvim" \
-        "$HOME/.local/state/nvim" "$HOME/.cache/nvim"; do
-        [ -e "$d" ] && run "mv '$d' '${d}.bak'"
-      done
-      run "git clone https://github.com/LazyVim/starter '$nvim_cfg'"
-      run "rm -rf '$nvim_cfg/.git'"
-      ok "LazyVim installed. Run 'nvim' once to bootstrap plugins."
-    else
-      ok "LazyVim config already present."
-    fi
+  # --- Neovim ---
+  # Omarchy ships omarchy-nvim, which is LazyVim already configured. The Arch
+  # version of this script moved ~/.config/nvim aside and cloned the upstream
+  # starter over it -- that quietly discards Omarchy's config. Leave it alone.
+  if [ -f "$HOME/.config/nvim/lazyvim.json" ] || pacman_installed omarchy-nvim; then
+    ok "LazyVim already present (Omarchy's omarchy-nvim) — left untouched."
+  elif has_cmd nvim; then
+    warn "No LazyVim config found. Install Omarchy's with: omarchy-pkg-add omarchy-nvim"
   fi
 
-  # Zsh + Starship + Zoxide
-  if command -v zsh &>/dev/null; then
-    if ! command -v starship &>/dev/null; then
-      run "curl -sS https://starship.rs/install.sh | sh -s -- --yes"
-    fi
+  # --- Shell ---
+  # Omarchy is a bash desktop: its prompt, aliases and shell integration all
+  # live in bash. Switching to zsh is opt-in.
+  if [[ $SETUP_ZSH == 1 ]] && has_cmd zsh; then
     append_once 'eval "$(starship init zsh)"' "$HOME/.zshrc"
     append_once 'eval "$(zoxide init zsh)"' "$HOME/.zshrc"
-    append_once 'eval "$(zoxide init bash)"' "$HOME/.bashrc"
-    if [ "$SHELL" != "$(which zsh)" ]; then
-      run "chsh -s $(which zsh) $USER"
+    if [ "$SHELL" != "$(command -v zsh)" ]; then
+      run "chsh -s $(command -v zsh) $USER"
       warn "Shell changed to zsh — takes effect on next login."
+      warn "Omarchy's own shell config is bash-only; you are on your own there."
     fi
+  else
+    ok "Keeping bash (Omarchy's default). Re-run with SETUP_ZSH=1 to switch."
   fi
 
-  # Wayland clipboard aliases (bat and fd need no aliases on Arch)
-  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+  # starship, zoxide and fzf keybindings are already wired into Omarchy's bash
+  # config, so nothing is appended to .bashrc here.
+
+  # --- Clipboard aliases ---
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [ -f "$rc" ] || continue
     append_once 'alias pbcopy="wl-copy"' "$rc"
     append_once 'alias pbpaste="wl-paste"' "$rc"
   done
 
-  # fzf shell keybindings: Ctrl+R, Ctrl+T, Alt+C
-  # Arch installs these to /usr/share/fzf/ — different from Ubuntu
-  local fzf_kb="/usr/share/fzf/key-bindings.bash"
-  local fzf_co="/usr/share/fzf/completion.bash"
-  append_once "[ -f $fzf_kb ] && source $fzf_kb" "$HOME/.bashrc"
-  append_once "[ -f $fzf_co ] && source $fzf_co" "$HOME/.bashrc"
-
-  # Font cache
-  command -v fc-cache &>/dev/null && run "fc-cache -f"
+  has_cmd fc-cache && run "fc-cache -f"
 
   ok "Post-install configuration complete."
 }
@@ -358,95 +476,183 @@ post_install() {
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 # =============================================================================
 
-pacman_installed() { pacman -Qi "$1" &>/dev/null; }
-
-log "${BOLD}setup_system.sh${R}  •  CachyOS/Arch  •  $(date)"
+log "${BOLD}omarchy_system_setup.sh${R}  •  $(date)"
 log "Log: $LOG"
 $DRY_RUN && warn "DRY-RUN — nothing will be changed."
 
-# Sanity checks
-command -v pacman &>/dev/null || {
-  echo "Not an Arch-based system. Aborting."
+# --- Sanity checks ---
+if [[ $EUID -eq 0 ]]; then
+  echo "Do not run this as root — it uses sudo where it needs to, and installs" >&2
+  echo "into your own \$HOME." >&2
+  exit 1
+fi
+
+has_cmd pacman || {
+  echo "Not an Arch-based system. Aborting." >&2
   exit 1
 }
-sudo -v 2>/dev/null || {
-  echo "sudo required. Aborting."
+
+if ! grep -q '^ID=omarchy' /etc/os-release 2>/dev/null &&
+  [[ ! -d ${OMARCHY_PATH:-/usr/share/omarchy} ]] &&
+  ! has_cmd omarchy-pkg-add; then
+  warn "This does not look like an Omarchy install."
+  warn "Omarchy-specific steps (NVIDIA UKI rebuild, omarchy-* installers) will"
+  warn "fall back or be skipped."
+fi
+
+$DRY_RUN || sudo -v || {
+  echo "sudo required. Aborting." >&2
   exit 1
 }
+
+# Keep the sudo timestamp warm through the long installs.
+if ! $DRY_RUN; then
+  while true; do
+    sudo -n true 2>/dev/null || true
+    sleep 60
+    kill -0 "$$" 2>/dev/null || exit 0
+  done &
+  SUDO_KEEPALIVE_PID=$!
+  trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+fi
 
 # =============================================================================
 section "Base prerequisites"
 # =============================================================================
 
-# Enable multilib (32-bit support) — needed for Steam, Wine, lib32-* packages
-PACMAN_CONF="/etc/pacman.conf"
-if ! grep -q '^\[multilib\]' "$PACMAN_CONF"; then
-  info "Enabling [multilib] in pacman.conf..."
-  run "sudo sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' '$PACMAN_CONF'"
-  warn "[multilib] enabled — pacman -Sy will refresh the database shortly."
-else
+# [multilib] — needed for Steam, Wine and every lib32-* package.
+# Omarchy enables it out of the box, so this is a check, not a rewrite.
+if pacman-conf --repo-list 2>/dev/null | grep -qx multilib; then
   ok "[multilib] already enabled."
+else
+  info "Enabling [multilib] in /etc/pacman.conf..."
+  run "sudo cp /etc/pacman.conf /etc/pacman.conf.bak.\$(date +%Y%m%d%H%M%S)"
+  run "sudo sed -i '/^#\[multilib\]$/{s/^#//;n;s/^#Include/Include/}' /etc/pacman.conf"
+  run "sudo pacman -Sy --noconfirm"
 fi
 
 info "Updating package database..."
-run "sudo pacman -Sy"
+run "sudo pacman -Sy --noconfirm"
 
-# Ensure base tools are present
-info "Installing base prerequisites..."
-run "sudo pacman -S --noconfirm --needed git curl wget base-devel"
-
-# Flatpak
-if ! command -v flatpak &>/dev/null; then
-  info "Installing Flatpak..."
-  run "sudo pacman -S --noconfirm --needed flatpak"
-  run "flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo"
-  warn "Flatpak installed — reboot may be needed before GUI apps show in launcher."
+# yay is Omarchy's AUR helper and ships with the system.
+if ! has_cmd yay; then
+  warn "yay not found — AUR packages will be skipped."
 fi
 
-# paru (AUR helper) — CachyOS ships with it; install from AUR if missing
-if ! command -v paru &>/dev/null; then
-  info "paru not found — installing from AUR..."
-  PARU_BUILD=$(mktemp -d)
-  run "git clone https://aur.archlinux.org/paru-bin.git '$PARU_BUILD'"
-  run "cd '$PARU_BUILD' && makepkg -si --noconfirm"
-  run "rm -rf '$PARU_BUILD'"
-  command -v paru &>/dev/null && ok "paru installed." || {
-    echo "${RED}paru install failed. Aborting.${R}"
-    exit 1
-  }
-fi
+# =============================================================================
+setup_nvidia
+# =============================================================================
 
 # =============================================================================
 section "pacman packages — ${#PACMAN_PKGS[@]} queued"
 # =============================================================================
 print_list "${PACMAN_PKGS[@]}"
 log
-pacman_install_with_progress "${PACMAN_PKGS[@]}"
+install_with_progress repo "${PACMAN_PKGS[@]}"
 ok "pacman installs done."
 
 # =============================================================================
-section "AUR packages — ${#AUR_PKGS[@]} queued"
-# =============================================================================
-print_list "${AUR_PKGS[@]}"
-log
-aur_install_with_progress "${AUR_PKGS[@]}"
-ok "AUR installs done."
+if ((${#AUR_PKGS[@]} > 0)); then
+  section "AUR packages — ${#AUR_PKGS[@]} queued"
+  print_list "${AUR_PKGS[@]}"
+  log
+  install_with_progress aur "${AUR_PKGS[@]}"
+  ok "AUR installs done."
+fi
 
 # =============================================================================
-section "Flatpak apps — ${#FLATPAK_APPS[@]} queued"
+if ((${#OMARCHY_APPS[@]} > 0)); then
+  section "Omarchy apps — ${#OMARCHY_APPS[@]} queued"
+  print_list "${OMARCHY_APPS[@]}"
+  log
+  for app in "${OMARCHY_APPS[@]}"; do
+    installer="omarchy-install-$app"
+    log
+    log "  ${C}${installer}${R}"
+    if ! has_cmd "$installer"; then
+      warn "$installer not available on this system — skipping."
+      note_failure "omarchy $app"
+      continue
+    fi
+    # These installers open the app when they finish. The launch is detached
+    # (setsid + backgrounded), so it neither blocks this loop nor fails the
+    # install when there is no graphical session to launch into.
+    run "$installer </dev/null" ||
+      { warn "Failed: $installer"; note_failure "omarchy $app"; }
+  done
+  ok "Omarchy app installs done."
+fi
+
 # =============================================================================
-print_list "${FLATPAK_APPS[@]}"
-flatpak_install_with_progress "${FLATPAK_APPS[@]}"
-ok "Flatpak installs done."
+if ((${#FLATPAK_APPS[@]} > 0)); then
+  section "Flatpak apps — ${#FLATPAK_APPS[@]} queued"
+  if ! has_cmd flatpak; then
+    info "Installing Flatpak..."
+    pkg_add_one flatpak || note_failure "pkg flatpak"
+    run "flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo"
+  fi
+  print_list "${FLATPAK_APPS[@]}"
+  for app in "${FLATPAK_APPS[@]}"; do
+    log "  ${C}${app}${R}"
+    run "flatpak install --or-update -y flathub '$app'" ||
+      { warn "Failed: $app"; note_failure "flatpak $app"; }
+  done
+  ok "Flatpak installs done."
+else
+  section "Flatpak"
+  ok "FLATPAK_APPS is empty — Flatpak not installed (everything has a native package)."
+fi
 
 post_install
 
+# =============================================================================
+section "Verifying"
+# =============================================================================
+
+check() {
+  local label=$1 ok_flag=$2 detail=${3:-}
+  if [[ $ok_flag == yes ]]; then
+    log "  ${G}[ok]${R}   $label"
+  else
+    log "  ${Y}[todo]${R} $label${detail:+  — $detail}"
+  fi
+}
+
+if has_nvidia; then
+  has_cmd nvidia-smi && nv_drv=yes || nv_drv=no
+  { [[ -f /etc/modprobe.d/nvidia.conf ]] && grep -q 'modeset=1' /etc/modprobe.d/nvidia.conf; } && nv_kms=yes || nv_kms=no
+  check "NVIDIA driver installed (nvidia-smi present)" "$nv_drv" "needs a reboot"
+  check "NVIDIA early KMS configured" "$nv_kms"
+fi
+
+id -nG "$USER" | tr ' ' '\n' | grep -qx realtime && rt=yes || rt=no
+id -nG "$USER" | tr ' ' '\n' | grep -qx gamemode && gm=yes || gm=no
+pacman_installed steam && st=yes || st=no
+systemctl is-enabled ufw &>/dev/null && fw=yes || fw=no
+
+check "member of the realtime group" "$rt" "needs a full logout or reboot"
+check "member of the gamemode group" "$gm" "needs a full logout or reboot"
+check "Steam installed" "$st"
+check "UFW enabled" "$fw"
+
+# =============================================================================
 section "Done"
+# =============================================================================
+
+if ((${#FAILED[@]} > 0)); then
+  err "${#FAILED[@]} item(s) did not install:"
+  for f in "${FAILED[@]}"; do log "      - $f"; done
+  log "  Details are in the log; re-running the script retries only these."
+else
+  ok "Everything installed cleanly."
+fi
+
+log
 log "Full log: $LOG"
 log
 log "Next steps:"
-log "  1. ${BOLD}Reboot${R}"
-log "  2. Run ${BOLD}linux_audio_studio_setup.sh${R}"
-log "  3. Open ${BOLD}Timeshift${R} — create your first snapshot"
+log "  1. ${BOLD}Reboot${R}  (NVIDIA driver, group membership, early KMS)"
+log "  2. Run ${BOLD}./omarchy_audio_setup.sh${R}"
+log "  3. Snapshots are ${BOLD}snapper${R} + the Limine boot menu — no Timeshift needed"
 log "  4. Open ${BOLD}Unity Hub${R} — install your editor version"
-log "  5. Run ${BOLD}nvim${R} — LazyVim bootstraps on first launch"
+log "  5. ${BOLD}nvim${R} is already LazyVim via omarchy-nvim"
