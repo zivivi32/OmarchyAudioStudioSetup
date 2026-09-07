@@ -16,14 +16,21 @@
 #   - Package installs go through omarchy-pkg-add / omarchy-pkg-aur-add when
 #     available (idempotent, --needed), falling back to pacman/yay.
 #   - Arch has no /etc/sysctl.conf; settings go in /etc/sysctl.d/.
+#   - A stock Omarchy install has no /etc/security/limits.d, so every system
+#     file is written through write_system_file(), which creates the parent
+#     directory first.
 #
-# The whole script is idempotent: it is safe to run more than once.
+# The whole script is idempotent: it is safe to run more than once. If a step
+# does fail, an ERR trap prints the line and the call stack, so a partial run
+# reports itself instead of stopping quietly.
+#
+# Verified end to end on Omarchy 4.0.2 (Linux 7.1.9, Limine 12.6.0).
 # ---------------------------
 # NOTE: Run it with:
 #   chmod +x omarchy_audio_setup.sh && ./omarchy_audio_setup.sh
 # ---------------------------
 
-set -euo pipefail
+set -eEuo pipefail
 
 notify() {
   echo
@@ -48,42 +55,39 @@ if ! command -v pacman &>/dev/null; then
   exit 1
 fi
 
-if [[ ! -d $HOME/.local/share/omarchy ]] && ! command -v omarchy-pkg-add &>/dev/null; then
+# Omarchy 4 installs to /usr/share/omarchy (exported as $OMARCHY_PATH) and sets
+# ID=omarchy in /etc/os-release. Older layouts used ~/.local/share/omarchy, so
+# all three are accepted.
+if ! grep -q '^ID=omarchy' /etc/os-release 2>/dev/null &&
+  [[ ! -d ${OMARCHY_PATH:-/usr/share/omarchy} ]] &&
+  [[ ! -d $HOME/.local/share/omarchy ]] &&
+  ! command -v omarchy-pkg-add &>/dev/null; then
   warn "This does not look like an Omarchy install. Continuing anyway; the"
   warn "Limine bootloader step will be skipped if Limine is not present."
 fi
 
-# Ask for sudo once up front and keep the timestamp alive for the long
-# package/download steps, so the script doesn't stall waiting for a password.
-sudo -v
-while true; do
-  sudo -n true
-  sleep 60
-  kill -0 "$$" 2>/dev/null || exit
-done &
-SUDO_KEEPALIVE_PID=$!
-trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
-
-# Install repo packages, preferring Omarchy's idempotent helper.
-pkg_add() {
-  if command -v omarchy-pkg-add &>/dev/null; then
-    omarchy-pkg-add "$@"
-  else
-    sudo pacman -S --needed --noconfirm "$@"
-  fi
+# Report where a failure happened. Without this, `set -e` aborts silently on
+# whatever line broke and the run just stops mid-way with no explanation --
+# which is exactly how a partial install goes unnoticed.
+on_error() {
+  local rc=$1 line=$2 cmd=$3 i
+  echo >&2
+  echo "--------------------------------------------------------------------" >&2
+  echo "FAILED at line $line (exit $rc):" >&2
+  echo "  $cmd" >&2
+  # When the failure is inside a helper, the useful line is the caller's, so
+  # walk the call stack out to the top level of the script.
+  for ((i = 0; i < ${#FUNCNAME[@]} - 1; i++)); do
+    [[ ${FUNCNAME[i]} == on_error ]] && continue
+    echo "  called from ${FUNCNAME[i]}() at line ${BASH_LINENO[i]}" >&2
+  done
+  echo >&2
+  echo "Nothing after this point ran, so the setup is INCOMPLETE. Fix the" >&2
+  echo "cause and re-run: the script is idempotent, so the steps that already" >&2
+  echo "succeeded are skipped." >&2
+  echo "--------------------------------------------------------------------" >&2
 }
-
-# Install AUR packages, preferring Omarchy's helper (which wraps yay).
-aur_add() {
-  if command -v omarchy-pkg-aur-add &>/dev/null; then
-    omarchy-pkg-aur-add "$@"
-  elif command -v yay &>/dev/null; then
-    yay -S --needed --noconfirm "$@"
-  else
-    warn "No AUR helper found; skipping: $*"
-    return 1
-  fi
-}
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 # ------------------------------------------------------------------------------------
 # Wine / yabridge strategy
@@ -109,6 +113,52 @@ if [[ $WINE_STRATEGY != "pin" && $WINE_STRATEGY != "latest" ]]; then
   echo "WINE_STRATEGY must be 'pin' or 'latest' (got: $WINE_STRATEGY)" >&2
   exit 1
 fi
+
+# Ask for sudo once up front and keep the timestamp alive for the long
+# package/download steps, so the script doesn't stall waiting for a password.
+sudo -v
+# `|| true` on every step: a lapsed timestamp must not fire the ERR trap or
+# kill the keepalive, it just means the next sudo re-prompts as normal.
+while true; do
+  sudo -n true 2>/dev/null || true
+  sleep 60
+  kill -0 "$$" 2>/dev/null || exit 0
+done &
+SUDO_KEEPALIVE_PID=$!
+trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+
+# Write a root-owned config file, creating its directory first.
+#
+# This is not defensive padding: a stock Omarchy install has NO
+# /etc/security/limits.d, so a bare `sudo tee` there fails, and under
+# `set -e` that aborted the whole script before the audio group, REAPER,
+# Wine and yabridge steps ever ran.
+write_system_file() {
+  local path=$1
+  sudo mkdir -p "$(dirname "$path")"
+  sudo tee "$path" >/dev/null
+}
+
+# Install repo packages, preferring Omarchy's idempotent helper.
+pkg_add() {
+  if command -v omarchy-pkg-add &>/dev/null; then
+    omarchy-pkg-add "$@"
+  else
+    sudo pacman -S --needed --noconfirm "$@"
+  fi
+}
+
+# Install AUR packages, preferring Omarchy's helper (which wraps yay).
+aur_add() {
+  if command -v omarchy-pkg-aur-add &>/dev/null; then
+    omarchy-pkg-aur-add "$@"
+  elif command -v yay &>/dev/null; then
+    yay -S --needed --noconfirm "$@"
+  else
+    warn "No AUR helper found; skipping: $*"
+    return 1
+  fi
+}
 
 # ------------------------------------------------------------------------------------
 # Update the system
@@ -141,7 +191,7 @@ pkg_add \
 JACK_LD_CONF=/etc/ld.so.conf.d/pipewire-jack.conf
 if [[ ! -f $JACK_LD_CONF ]] || ! grep -q '/usr/lib/pipewire-0.3/jack' "$JACK_LD_CONF"; then
   echo "Registering PipeWire's JACK libraries with the dynamic linker"
-  echo "/usr/lib/pipewire-0.3/jack" | sudo tee "$JACK_LD_CONF" >/dev/null
+  echo "/usr/lib/pipewire-0.3/jack" | write_system_file "$JACK_LD_CONF"
   sudo ldconfig
 else
   echo "PipeWire JACK libraries already registered."
@@ -172,7 +222,7 @@ if command -v limine-mkinitcpio &>/dev/null || [[ -d /etc/limine-entry-tool.d ]]
     echo "Pro-audio kernel parameters already configured in $LIMINE_DROP_IN"
   else
     sudo mkdir -p /etc/limine-entry-tool.d
-    cat <<EOF | sudo tee "$LIMINE_DROP_IN" >/dev/null
+    cat <<EOF | write_system_file "$LIMINE_DROP_IN"
 # Pro-audio kernel parameters (added by omarchy_audio_setup.sh)
 # threadirqs: threaded interrupt handlers, so audio IRQs can be prioritised.
 # cpufreq.default_governor=performance: stop the CPU clocking down mid-take.
@@ -214,6 +264,12 @@ fi
 # runtime and can override the boot default above. If you still see the
 # governor drop back, set the profile for a session with:
 #   powerprofilesctl set performance
+if [[ ! -d /sys/devices/system/cpu/cpufreq/policy0 ]]; then
+  warn "This kernel exposes no cpufreq policy, so"
+  warn "cpufreq.default_governor=performance will have no effect here."
+  warn "That is normal in a VM, and on Intel hosts where intel_pstate runs in"
+  warn "active mode. threadirqs still applies; the governor line is harmless."
+fi
 
 # ---------------------------
 # limits
@@ -226,7 +282,7 @@ AUDIO_LIMITS=/etc/security/limits.d/audio.conf
 if [[ -f $AUDIO_LIMITS ]] && grep -q 'rtprio' "$AUDIO_LIMITS"; then
   echo "Realtime limits already configured in $AUDIO_LIMITS"
 else
-  printf '@audio - rtprio 90\n@audio - memlock unlimited\n' | sudo tee "$AUDIO_LIMITS" >/dev/null
+  printf '@audio - rtprio 90\n@audio - memlock unlimited\n' | write_system_file "$AUDIO_LIMITS"
   echo "Wrote $AUDIO_LIMITS"
 fi
 
@@ -242,7 +298,7 @@ if [[ -f $AUDIO_SYSCTL ]] && grep -q 'max_user_watches' "$AUDIO_SYSCTL"; then
   echo "inotify limit already configured in $AUDIO_SYSCTL"
 else
   printf '# Raised for sample libraries and project trees (pro-audio setup)\nfs.inotify.max_user_watches=600000\n' |
-    sudo tee "$AUDIO_SYSCTL" >/dev/null
+    write_system_file "$AUDIO_SYSCTL"
   sudo sysctl --system >/dev/null
   echo "Wrote $AUDIO_SYSCTL"
 fi
@@ -392,7 +448,7 @@ esac
 if [[ -d $HOME/.wine/drive_c/windows/Fonts ]] && compgen -G "$HOME/.wine/drive_c/windows/Fonts/times*" >/dev/null; then
   echo "corefonts already installed in the Wine prefix."
 else
-  winetricks -q corefonts
+  winetricks -q corefonts || warn "winetricks corefonts failed; plugin GUIs may render without fonts."
 fi
 
 # ------------------------------------------------------------------------------------
@@ -444,7 +500,7 @@ if command -v yabridgectl &>/dev/null; then
       yabridgectl add "$dir"
     fi
   done
-  yabridgectl sync
+  yabridgectl sync || warn "yabridgectl sync failed -- run it by hand once Wine is working."
 fi
 
 # ---------------------------
@@ -469,9 +525,43 @@ fi
 # ---------------------------
 # FINISHED!
 # ---------------------------
+notify "Verifying"
+
+check() { # check <label> <ok-condition-output> ; prints PASS/TODO
+  local label=$1 ok=$2 detail=${3:-}
+  if [[ $ok == yes ]]; then
+    printf '  [ok]   %s\n' "$label"
+  else
+    printf '  [todo] %s%s\n' "$label" "${detail:+  -- $detail}"
+  fi
+}
+
+grep -q threadirqs /proc/cmdline && cmdline_ok=yes || cmdline_ok=no
+[[ -f /etc/security/limits.d/audio.conf ]] && limits_file_ok=yes || limits_file_ok=no
+cur_rtprio=$(ulimit -r 2>/dev/null || echo 0)
+# ulimit can print "unlimited", which is not a number -- treat it as passing.
+if [[ $cur_rtprio == unlimited ]] || { [[ $cur_rtprio =~ ^[0-9]+$ ]] && ((cur_rtprio >= 90)); }; then
+  rtprio_ok=yes
+else
+  rtprio_ok=no
+fi
+id -nG "$USER" | tr ' ' '\n' | grep -qx audio && group_ok=yes || group_ok=no
+[[ -d $HOME/REAPER ]] && reaper_ok=yes || reaper_ok=no
+command -v yabridgectl &>/dev/null && yab_ok=yes || yab_ok=no
+
+check "kernel parameters live (threadirqs in /proc/cmdline)" "$cmdline_ok" "needs a reboot"
+check "realtime limits file written" "$limits_file_ok"
+check "realtime limits active in this shell (rtprio >= 90)" "$rtprio_ok" "needs a full logout or reboot"
+check "member of the audio group" "$group_ok" "needs a full logout or reboot"
+check "REAPER installed at ~/REAPER" "$reaper_ok"
+check "yabridgectl available" "$yab_ok"
+
 notify "Done - please reboot."
 cat <<'EOF'
-After rebooting, check that everything took:
+Every [todo] above that says "needs a reboot" clears on the next boot. Re-run
+this script afterwards to re-check; it is idempotent.
+
+After rebooting, confirm by hand:
 
   cat /proc/cmdline                 # should contain threadirqs
   ulimit -r -l                      # rtprio 90, memlock unlimited
